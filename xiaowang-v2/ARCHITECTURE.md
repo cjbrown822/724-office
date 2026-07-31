@@ -7,7 +7,7 @@
 
 **小王 = 一个常驻的、带持久记忆的 agent**：单个 Node 进程，背后一个 SQLite 库，每 5 秒醒一次干后台活，通过企业微信收发。不是"调一次 API 答一句"的 bot，是"活着、记得、到点自己做事"的躯体。
 
-部署事实〔实测〕：阿里云 ECS `<server-ip>`:`8080`，systemd `xiaowang-v2`（active + 开机自启），Node `v24.17.0`，1.6G 内存。代码 `/opt/xiaowang-v2/`，库 `v2.db`。本地源码 `<local-repo>`（git `continuity-p0-p2`，server==repo，17 .mjs 哈希一致）。
+部署事实〔实测〕：阿里云 ECS `<server-ip>`:`8080`，systemd `xiaowang-v2`（active + 开机自启），Node `v24.17.0`，1.6G 内存。代码 `/opt/xiaowang-v2/`，库 `v2.db`。本地源码 `<local-repo>\`（git `continuity-p0-p2`，server==repo，17 .mjs 哈希一致）。
 
 ## 第 1 层 · 7 项能力
 

@@ -17,9 +17,9 @@
 // 可整块删除（原则6）：删本文件 + adapter 媒体分流即可退回纯文本。
 // =====================================================================
 
-import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn, execFile } from 'node:child_process';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, statSync, copyFileSync } from 'node:fs';
+import { join, resolve, sep, extname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { getDb, tx, nowMs } from './db.mjs';
@@ -57,6 +57,74 @@ const VOICE_ASR = ENV.VOICE_ASR || '';
 const MEDIA_DIR = ENV.MEDIA_DIR ? ENV.MEDIA_DIR : join(DIR, 'media');
 // 媒体字节上限（防 1.6G 机 OOM + 同步 base64 编码阻塞 event loop 拖垮 worker tick/心跳）。默认 20MB。
 const MAX_MEDIA_BYTES = parseInt(ENV.MAX_MEDIA_BYTES || String(20 * 1024 * 1024), 10);
+
+// ---- 收微信文件：落沙箱（read_file 只能读沙箱内，故文件必须进沙箱才可被 agent 读） ----
+// SANDBOX_DIR 与 tools.mjs 同一 env；这里本地读，不 import tools.mjs——否则 media→tools→adapter→media 成环。
+const SANDBOX_DIR = resolve(ENV.XW2_SANDBOX_DIR || join(DIR, 'workspace'));
+const INBOX_SUBDIR = 'inbox';
+// 文本类扩展名：这些文件读一段预览喂给模型（省一次 read_file 往返）；其它只给路径。
+const TEXT_EXTS = new Set(['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.log', '.yaml', '.yml', '.xml', '.html', '.htm', '.ini', '.conf', '.py', '.js', '.mjs', '.ts', '.sql']);
+
+function fileExt(name) {
+  const e = (typeof name === 'string' ? extname(name) : '').toLowerCase();
+  return /^\.[a-z0-9]{1,8}$/i.test(e) ? e : '.bin';
+}
+// 文件名消毒：去路径分隔/../控制符/Windows 保留字符，保留中文与常规字符；空则回退。
+function sanitizeFilename(name) {
+  let n = String(name || '').replace(/[\\/]/g, '_').replace(/\.\.+/g, '.').replace(/[\x00-\x1f<>:"|?*]/g, '').trim();
+  n = n.replace(/^\.+/, ''); // 不以点开头（防 "."、隐藏文件）
+  if (!n) n = 'file' + fileExt(name);
+  return n.slice(0, 120);
+}
+// 把下载好的字节（MEDIA_DIR 不可逆原件）复制进沙箱 inbox，返回 { rel, abs }。重名自动加序号。
+// 沙箱穿越再兜底校验一次（防 sanitize 疏漏），与 tools.resolveSandboxPath 同一断言口径。
+function saveToSandbox(srcPath, originalName) {
+  // 沙箱根在调用时读 env（与 downloadMedia mock 的 MEDIA_DIR 同款）：让 selftest 能指向临时目录不污染仓库。
+  const inboxAbs = resolve(process.env.XW2_SANDBOX_DIR || SANDBOX_DIR, INBOX_SUBDIR);
+  if (!existsSync(inboxAbs)) mkdirSync(inboxAbs, { recursive: true });
+  const base = sanitizeFilename(originalName);
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  let candidate = base, abs = resolve(inboxAbs, candidate), i = 1;
+  while (existsSync(abs)) { candidate = `${stem}-${i}${ext}`; abs = resolve(inboxAbs, candidate); i++; }
+  if (abs !== inboxAbs && !abs.startsWith(inboxAbs + sep)) throw new Error('sandbox escape blocked: ' + originalName);
+  copyFileSync(srcPath, abs);
+  return { rel: `${INBOX_SUBDIR}/${candidate}`, abs };
+}
+
+// ---- 文件台账（沙箱根 FILES.md）：收到文件自动记一行，让"有哪些文件"每轮摊在模型眼前 ----
+// 为什么是沙箱里的 md 不是新表/新工具：台账要能被 context 注入 + 被模型用现成 read_file/write_file
+// 自己维护（标长期/单次、补说明、删过期行），零新工具零新表（原则6/7）；正史仍在 media_log/episodes，
+// 台账坏了/被误改可从正史重建。行内容做了防注入清洗（去换行/竖线、截断）——它会进 system prompt。
+const LEDGER_NAME = 'FILES.md';
+const LEDGER_HEADER =
+  '# 文件台账（一行一文件：路径 ｜ 收到日期 ｜ 长期/单次/待定 ｜ 一句话说明）\n' +
+  '（系统收到文件自动加行，状态默认「待定」。小王用 write_file 维护本文件：判断或问清用途后把「待定」改成「长期/单次」、把说明补准、删掉确认不要的行。）\n\n';
+export function appendFilesLedger(rel, note) {
+  try {
+    const root = resolve(process.env.XW2_SANDBOX_DIR || SANDBOX_DIR);
+    const fp = resolve(root, LEDGER_NAME);
+    const d = new Date(nowMs() + 8 * 3600 * 1000); // CST 日期
+    const date = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    const clean = String(note ?? '').replace(/[\r\n|｜]+/g, ' ').trim().slice(0, 50);
+    const line = `- ${rel} ｜ ${date} ｜ 待定 ｜ ${clean}\n`;
+    if (!existsSync(fp)) writeFileSync(fp, LEDGER_HEADER + line, 'utf8');
+    else appendFileSync(fp, line, 'utf8');
+  } catch (e) {
+    console.error('[media] 文件台账追加失败(不阻断收件): %s', e.message);
+  }
+}
+
+// 台账"一句话说明"的确定性来源：取文本首个非空行（剥 markdown 标题符），没有就空串。
+function firstLine(s) {
+  return (
+    String(s || '')
+      .split('\n')
+      .map((x) => x.replace(/^#+\s*/, '').trim())
+      .find((x) => x) || ''
+  );
+}
 
 // 媒体下载 URL 的 SSRF 兜底（path3 fileHttpUrl 来自回调、可控）：拦内网/链路本地/云元数据/IPv6。
 // 本地极简版（避免 media→tools 形成 import 环）；正常 qiwe CDN URL 不受影响。
@@ -117,6 +185,8 @@ async function downloadMedia(msgData, kind, { mock = false } = {}) {
     return fp;
   }
   const fileType = kind === 'image' ? 1 : 5; // e云: 1=图片 5=语音/文件
+  // 文件观测（原则4）：只打字段名 + 文件名 + 大小，【不打 auth/aes/url 这些一次性下载密钥】（防日志泄密）。
+  if (kind === 'file') console.error('[media][file] keys=%s name=%s size=%s', Object.keys(msgData).join(','), msgData.filename || msgData.fileName || '?', msgData.fileSize || msgData.fileBigSize || '?');
   const fileId = msgData.fileId || '';
   const fileAesKey = msgData.fileAeskey || msgData.fileAesKey || '';
   const fileAuthKey = msgData.fileAuthkey || msgData.fileAuthKey || '';
@@ -132,15 +202,17 @@ async function downloadMedia(msgData, kind, { mock = false } = {}) {
     if (j.code === 0 && j.data?.cloudUrl) cloudUrl = j.data.cloudUrl;
     else console.error('[media] wxWorkDownload', j.code, j.msg);
   }
-  if (!cloudUrl && fileAuthKey) { // 路径2: 个微格式(有 authKey)
-    const fileUrl = msgData.fileBigHttpUrl || msgData.fileMiddleHttpUrl || msgData.fileThumbHttpUrl || '';
+  if (!cloudUrl && fileAuthKey) { // 路径2: 个微格式(有 authKey)——真机文件走这条
+    // 真机实证：文件的 fileHttpUrl 是加密 URL（imunion.weixin.qq.com/tpdownloadmedia），直接 fetch 返 400；
+    // 必须过 e云 wxDownload 解密拿 cloudUrl。故 fileHttpUrl 也进候选（之前只认 fileBig/Middle/Thumb → 真机文件漏）。
+    const fileUrl = msgData.fileHttpUrl || msgData.fileBigHttpUrl || msgData.fileMiddleHttpUrl || msgData.fileThumbHttpUrl || msgData.fileUrl || '';
     if (fileUrl) {
       const j = await qiweApi('/cloud/wxDownload', { fileAeskey: fileAesKey, fileAuthkey: fileAuthKey, fileUrl, fileSize, fileType });
       if (j.code === 0 && j.data?.cloudUrl) cloudUrl = j.data.cloudUrl;
       else console.error('[media] wxDownload', j.code, j.msg);
     }
   }
-  if (!cloudUrl) cloudUrl = msgData.fileHttpUrl || msgData.fileUrl || ''; // 路径3: 直接 HTTP 兜底
+  if (!cloudUrl && !fileAuthKey) cloudUrl = msgData.fileHttpUrl || msgData.fileUrl || ''; // 路径3: 无 authKey 时才直连兜底（有 authKey 的加密 URL 直连必 400）
   if (!cloudUrl) { console.error('[media] no url, keys=', Object.keys(msgData).join(',')); return null; }
   // SSRF 兜底：path3 的 fileHttpUrl/fileUrl 来自回调可控，拦内网/元数据地址。
   if (isBlockedUrl(cloudUrl)) { console.error('[media] blocked internal/metadata media url (SSRF 防护)'); return null; }
@@ -150,11 +222,16 @@ async function downloadMedia(msgData, kind, { mock = false } = {}) {
     const clen = Number(resp.headers.get('content-length') || 0);
     if (clen > MAX_MEDIA_BYTES) { console.error('[media] content-length %dB exceeds cap %dB, abort', clen, MAX_MEDIA_BYTES); return null; }
     const buf = Buffer.from(await resp.arrayBuffer());
+    // 0 字节 = 下载没拿到内容（真机 PDF 就栽在这：cloudUrl 拿错/为空、抓回空体）。当失败处理，
+    // 给"文件没收完整"回执，而不是存个 0B 空文件让 read_file 读出空串（用户看到的"读取失败"根因）。
+    if (buf.length === 0) { console.error('[media] downloaded 0B (kind=%s http=%s url=%s) — treat as failed', kind, resp.status, String(cloudUrl).slice(0, 80)); return null; }
     // 大小卡口③：无 Content-Length 时的最后兜底（已读入但不落盘/不编码，避免后续 base64 阻塞）。
     if (buf.length > MAX_MEDIA_BYTES) { console.error('[media] downloaded %dB exceeds cap %dB, drop', buf.length, MAX_MEDIA_BYTES); return null; }
     if (!existsSync(MEDIA_DIR)) mkdirSync(MEDIA_DIR, { recursive: true });
     const rnd = nowMs().toString(36) + '-' + buf.length.toString(36);
-    const fp = join(MEDIA_DIR, `${rnd}_${kind}${mediaExt(buf, kind)}`);
+    // 文件保留原扩展名（.md/.pdf/.docx…）；图片/语音按字节头判类型。真机文件名字段是 filename(小写)。
+    const ext = kind === 'file' ? fileExt(msgData.filename || msgData.fileName) : mediaExt(buf, kind);
+    const fp = join(MEDIA_DIR, `${rnd}_${kind}${ext}`);
     writeFileSync(fp, buf);
     console.log(`[media] saved ${kind} ${buf.length}B -> ${fp}`);
     return fp;
@@ -225,6 +302,19 @@ async function transcribeVoice(fp, { mock = false } = {}) {
   }
 }
 
+// ---- PDF 正文抽取（poppler-utils 的 pdftotext；bounded execFile：固定二进制+参数数组，不拼 shell） ----
+// 装了才用；没装/抽取失败返空串（扫描件/加密 PDF 抽不出，honest 降级）。
+function extractPdfText(absPath) {
+  return new Promise((resolve) => {
+    try {
+      execFile('pdftotext', ['-q', '-enc', 'UTF-8', absPath, '-'], { maxBuffer: 20 * 1024 * 1024, timeout: 30000 }, (err, stdout) => {
+        if (err) { console.error('[media] pdftotext 失败: %s', err.message); resolve(''); }
+        else resolve(String(stdout || '').replace(/\f/g, '\n').trim());
+      });
+    } catch (e) { console.error('[media] pdftotext 无法启动: %s', e.message); resolve(''); }
+  });
+}
+
 // ---- media_log 落库（两层：file_path 不可逆 + transcript 可再生） ----
 function storeMedia({ sessionId, senderId, kind, fp, transcript, model }) {
   return tx((c) => {
@@ -248,7 +338,61 @@ function storeMedia({ sessionId, senderId, kind, fp, transcript, model }) {
 export async function handleMedia({ senderId, sessionId = null, msgData, kind, mock = false }) {
   const fp = await downloadMedia(msgData, kind, { mock });
   if (!fp) {
-    return { mediaLogId: null, receipt: kind === 'image' ? '图片没收完整，再发一次？' : '语音没收完整，再发一次？', feedText: null, desc: null };
+    const r = kind === 'image' ? '图片没收完整，再发一次？' : kind === 'file' ? '文件没收完整，再发一次？' : '语音没收完整，再发一次？';
+    return { mediaLogId: null, receipt: r, feedText: null, desc: null };
+  }
+
+  if (kind === 'file') {
+    // 文件：原件已在 MEDIA_DIR（不可逆层），复制进沙箱 inbox 让 read_file 能读。
+    // 真机文件名字段是 filename(小写)——之前只读 fileName(驼峰) → 拿不到名字存成 file.bin（真机 bug 根因之一）。
+    const originalName = (typeof msgData.filename === 'string' && msgData.filename.trim()) ? msgData.filename.trim()
+      : (typeof msgData.fileName === 'string' && msgData.fileName.trim()) ? msgData.fileName.trim()
+      : 'file' + fileExt('');
+    let saved;
+    try {
+      saved = saveToSandbox(fp, originalName);
+    } catch (e) {
+      console.error('[media] 文件落沙箱失败: %s', e.message);
+      return { mediaLogId: null, receipt: '文件收到了但没存成，再发一次？', feedText: null, desc: null };
+    }
+    const bytes = statSync(saved.abs).size;
+    const ext = fileExt(originalName);
+    const humanSize = bytes >= 1024 * 1024 ? (bytes / 1024 / 1024).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
+
+    // PDF：二进制，read_file 读不了 → pdftotext 抽正文存成 sandbox 里的 .txt，让 read_file 读全文。
+    if (ext === '.pdf') {
+      const text = await extractPdfText(saved.abs);
+      const id = storeMedia({ sessionId, senderId, kind: 'file', fp, transcript: text ? text.slice(0, 2000) : null, model: text ? 'pdftotext' : null });
+      if (text) {
+        const txtAbs = saved.abs.replace(/\.pdf$/i, '') + '.txt';
+        const txtRel = saved.rel.replace(/\.pdf$/i, '') + '.txt';
+        try { writeFileSync(txtAbs, text, 'utf8'); } catch (e) { console.error('[media] 写 PDF 文本失败: %s', e.message); }
+        console.log(`[media] pdf text extracted: ${txtRel} (${text.length} chars)`);
+        // 台账指向可 read_file 的 .txt（原 PDF 是二进制，指过去也读不了）
+        appendFilesLedger(txtRel, `${originalName} 的正文｜${firstLine(text)}`);
+        let feedText = `【收到 PDF】「${originalName}」（约 ${humanSize}），已提取文本到沙箱：${txtRel}。用 read_file 读它看全文/做分析（原 PDF 在 ${saved.rel}）。`;
+        feedText += `\n开头预览：\n${text.slice(0, 800)}`;
+        return { mediaLogId: id, receipt: null, feedText, desc: null };
+      }
+      // 抽不出（扫描件/加密）——honest 降级
+      console.log(`[media] pdf saved but no text extracted: ${saved.rel}`);
+      appendFilesLedger(saved.rel, `${originalName}（PDF 没提取出文字：扫描件/加密，内容不可读）`);
+      return { mediaLogId: id, receipt: null, feedText: `【收到 PDF】「${originalName}」（约 ${humanSize}），已存沙箱 ${saved.rel}，但没提取出文字（可能是扫描件或加密 PDF，抽不出文本）。`, desc: null };
+    }
+
+    // 文本文件：读一段预览省一次 read_file 往返。
+    let preview = '';
+    if (TEXT_EXTS.has(ext) && bytes <= 64 * 1024) {
+      try { preview = readFileSync(saved.abs, 'utf8').slice(0, 800); } catch { /* 读预览失败不影响落库 */ }
+    }
+    const id = storeMedia({ sessionId, senderId, kind: 'file', fp, transcript: preview || null, model: null });
+    // 台账：文本文件记首行做说明；非文本（zip/docx/图包等）如实标"读不了"——不然它在台账上
+    // 看着像可用资料，模型会去 read_file 撞墙或（更糟）凭文件名编内容。
+    appendFilesLedger(saved.rel, preview ? firstLine(preview) : `（${ext || '二进制'} 文件，read_file 读不了——要用内容得转成 md/pdf 重发）`);
+    let feedText = `【收到文件】「${originalName}」（约 ${humanSize}），已存进你的沙箱：${saved.rel}。需要看内容或做分析时，用 read_file 读这个路径。`;
+    if (preview) feedText += `\n开头预览：\n${preview}`;
+    console.log(`[media] file saved to sandbox: ${saved.rel} (${bytes}B)`);
+    return { mediaLogId: id, receipt: null, feedText, desc: null };
   }
 
   if (kind === 'image') {
@@ -318,6 +462,35 @@ async function runSelftest() {
     // 语音不另写 media episode（避免与 onMessage 的 user 轮重复）
     const vep = conn.prepare(`SELECT COUNT(*) c FROM episodes WHERE entity='media' AND task_id=?`).get(voc.mediaLogId);
     ok(vep.c === 0, '语音不另写 media episode（避免重复）');
+
+    // 文件：mock 下载 → 落沙箱 inbox（原名）→ media_log kind=file + 文本预览 + feedText 告知 read_file
+    process.env.XW2_SANDBOX_DIR = join(dir, 'sandbox');
+    const file = await handleMedia({ senderId: 'OWNER', sessionId: 'wecom:OWNER', msgData: { fileId: 'f', fileAeskey: 'k', fileName: '购车框架.md', fileSize: 9 }, kind: 'file', mock: true });
+    ok(file.mediaLogId > 0 && file.receipt === null && file.feedText && /read_file/.test(file.feedText), '文件：返回 feedText 告知已存沙箱+可 read_file，不发独立回执');
+    ok(/inbox\/购车框架\.md/.test(file.feedText), 'feedText 含沙箱相对路径（原文件名保留）');
+    ok(existsSync(join(dir, 'sandbox', 'inbox', '购车框架.md')), '文件真落到沙箱 inbox（read_file 可读）');
+    const frow = conn.prepare('SELECT * FROM media_log WHERE id=?').get(file.mediaLogId);
+    ok(frow && frow.kind === 'file' && frow.file_path, 'media_log 记 kind=file + 不可逆原件路径');
+
+    // 文件台账：收件自动加行（路径｜日期｜待定｜说明），头部含维护说明
+    const ledgerFp = join(dir, 'sandbox', 'FILES.md');
+    ok(existsSync(ledgerFp), '收文件后 FILES.md 台账已建');
+    const ledger1 = readFileSync(ledgerFp, 'utf8');
+    ok(/^# 文件台账/.test(ledger1) && /write_file 维护/.test(ledger1), '台账头部=格式说明+维护指令');
+    ok(/- inbox\/购车框架\.md ｜ \d{4}-\d{2}-\d{2} ｜ 待定 ｜/.test(ledger1), '台账行格式：路径｜日期｜待定｜说明');
+    // 再收一个 → 追加不覆盖；行内容不含换行/竖线（防注入 system prompt 的段结构）
+    await handleMedia({ senderId: 'OWNER', sessionId: 'wecom:OWNER', msgData: { fileId: 'f', fileAeskey: 'k', fileName: '第二份.md', fileSize: 9 }, kind: 'file', mock: true });
+    const ledger2 = readFileSync(ledgerFp, 'utf8');
+    ok(ledger2.includes('购车框架.md') && ledger2.includes('第二份.md'), '第二个文件追加进台账（不覆盖旧行）');
+    appendFilesLedger('inbox/evil.md', '恶意\n换行｜竖线|注入'.repeat(20));
+    const evilLine = readFileSync(ledgerFp, 'utf8').split('\n').find((l) => l.includes('evil'));
+    ok(evilLine && !evilLine.includes('｜竖线') && evilLine.length < 120, '台账行清洗：换行/竖线剥掉、超长截断（防 prompt 段注入）');
+
+    // 文件名穿越防护：../ 被消毒，落点仍在 inbox 内（feedText 会原样回显原始恶意名，故只校验"落盘路径"）
+    const esc = await handleMedia({ senderId: 'OWNER', sessionId: 'wecom:OWNER', msgData: { fileId: 'f', fileAeskey: 'k', fileName: '../../etc/passwd', fileSize: 9 }, kind: 'file', mock: true });
+    const escPath = (esc.feedText.match(/沙箱：(\S+?)。/) || [])[1] || '';
+    ok(esc.mediaLogId > 0 && escPath.startsWith('inbox/') && !escPath.includes('..'), '恶意文件名 ../../ 被消毒为 inbox 内安全名，不穿越沙箱');
+    ok(!existsSync(join(dir, 'sandbox', 'etc', 'passwd')) && !existsSync(join(dir, 'etc', 'passwd')), '穿越目标 etc/passwd 未被写出（沙箱外零落地）');
 
     // 下载失败 → 回执提示重发
     const bad = await handleMedia({ senderId: 'OWNER', sessionId: 'wecom:OWNER', msgData: {}, kind: 'image', mock: false });

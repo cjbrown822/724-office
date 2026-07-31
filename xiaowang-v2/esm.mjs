@@ -152,7 +152,15 @@ async function callLLM(messages) {
     const r = await fetch(url, {
       method: 'POST', signal: ac.signal,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ENV.LLM_API_KEY}` },
-      body: JSON.stringify({ model: ENV.LLM_MODEL || 'deepseek-chat', temperature: 0.2, response_format: { type: 'json_object' }, messages }),
+      body: JSON.stringify({
+        model: ENV.LLM_MODEL || 'deepseek-chat',
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        messages,
+        // 打卡编码是纯结构化抽取，不需要思考态：DeepSeek/GLM 默认 thinking=enabled 会白慢 ~4x（07-01 实测），
+        // 显式关掉（两家同用 thinking:{type} 语义；其它端点不发这个字段，防 400）。
+        ...(/deepseek|bigmodel|z\.ai/i.test(url) ? { thinking: { type: 'disabled' } } : {}),
+      }),
     });
     if (!r.ok) throw new Error(`LLM ${r.status}: ${(await r.text()).slice(0, 200)}`);
     return JSON.parse((await r.json()).choices[0].message.content);

@@ -16,9 +16,36 @@
 // 可整块删除（原则6 为删除而构建）：删掉它 + loop 退回纯召回即可。
 // =====================================================================
 
+import { readFileSync, existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+
 import { getDb, nowMs, RECENT_TURNS_LIMIT, RELEVANCE_FLOOR, HEDGE_THRESHOLD } from './db.mjs';
 import { retrieve, retrieveMedia, pinnedFacts, getSummary } from './memory.mjs';
 import { getPending, isPendingExpired } from './esm.mjs';
+import { todaySummary } from './todo.mjs';
+
+// 沙箱根与 tools/media 同一 env 约定，本地解析不 import 工具层（依赖方向不倒挂）。
+// 每次调用时读 process.env：selftest 会在 import 后才设 XW2_SANDBOX_DIR（与 media.mjs 同款处理）。
+function sandboxRoot() {
+  return resolve(process.env.XW2_SANDBOX_DIR || join(import.meta.dirname, 'workspace'));
+}
+
+/**
+ * 读沙箱根的文件台账 FILES.md（media.mjs 收件自动追加、模型自己维护）。
+ * 台账=渐进式加载的索引层：让"有哪些文件"每轮摊在模型眼前，read_file 是按需层。
+ * 没有台账（未收过文件的实例，如朋友）→ 返回 ''，prompt 层零痕迹。
+ * 读上限 4000 字符兜 IO（注入截断在 prompt 层做，那里管 token 预算）。
+ */
+export function readFilesLedger() {
+  try {
+    const fp = join(sandboxRoot(), 'FILES.md');
+    if (!existsSync(fp)) return '';
+    return readFileSync(fp, 'utf8').slice(0, 4000);
+  } catch (e) {
+    console.error('[context] 文件台账读取失败(降级无台账): %s', e.message);
+    return '';
+  }
+}
 
 /**
  * 组装一条入站消息的上下文五层。纯同步 SQLite 读，无副作用、无 LLM。
@@ -33,10 +60,10 @@ export function assembleContext(sessionId, userInput) {
   // ① 逐字近窗（只取 user/assistant 文本；绝不取 role='tool'，否则裸 tool 消息进 messages 会 400）。
   const recentTurns = recentVerbatim(sessionId, sum.covers_until_id);
 
-  // ② 锚点台账（pinned 事实全量，极少 token）。
+  // ② 锚点台账（pinned 事实全量，极少 token）。含 pin_tier：core/index 由 prompt 层分段渲染。
   let anchors = [];
   try {
-    anchors = pinnedFacts(12);
+    anchors = pinnedFacts();
   } catch (e) {
     console.error('[context] pinnedFacts 失败，降级空锚点: %s', e.message);
   }
@@ -84,7 +111,15 @@ export function assembleContext(sessionId, userInput) {
     console.error('[context] sinceLastMs 计算失败(忽略): %s', e.message);
   }
 
-  return { recentTurns, summary: sum.summary, anchors, recalled, recallWeak, pendingCheckin, sinceLastMs };
+  // ⑧ 今日待办摘要（TODO_SECRET 实例才有面板/表）：每轮注入一行今天要做的事 + 挂账天数。
+  //   取代过去手动维护会过期的"周待办"pinned 锚点——这份从面板表自动生成、永远最新（原则8：常驻只放指针，详情靠 todo_list 拉）。
+  let todayTodos = [];
+  if (process.env.TODO_SECRET) {
+    try { todayTodos = todaySummary(getDb()); }
+    catch (e) { console.error('[context] todaySummary 失败(忽略): %s', e.message); }
+  }
+
+  return { recentTurns, summary: sum.summary, anchors, recalled, recallWeak, pendingCheckin, sinceLastMs, filesLedger: readFilesLedger(), todayTodos };
 }
 
 // 轮间时间事实的标注阈值：相邻两轮隔 ≥ 30 分钟才标（更短是正常对话节奏，标了只是噪声）。
@@ -187,6 +222,7 @@ async function runSelftest() {
   const dir = mkdtempSync(join(tmpdir(), 'xw2-ctx-'));
   const dbPath = join(dir, 'v2.db');
   process.env.XW2_DB_PATH = dbPath;
+  process.env.XW2_SANDBOX_DIR = join(dir, 'sandbox'); // 隔离台账读取，别读到仓库 workspace 的真台账
 
   try {
     const conn = db.initDb(dbPath);
@@ -245,7 +281,7 @@ async function runSelftest() {
     db.tx((c) => {
       c.prepare(
         `INSERT INTO facts (entity, fact, source, confidence, created_at, valid_from, importance, pinned)
-         VALUES ('居住', '现居上海', 'user_said', 0.9, ?, ?, 0.9, 1)`,
+         VALUES ('居住', '现居上海（独立租房）', 'user_said', 0.9, ?, ?, 0.9, 1)`,
       ).run(db.nowMs(), db.nowMs());
     });
     const ctx3 = assembleContext('A', 'x');
@@ -262,6 +298,19 @@ async function runSelftest() {
     ok(relevanceGate({ score: 1 }) === true && relevanceGate({ score: 0 }) === false, 'relevanceGate 按 score 地板过滤');
     const merged = dedupMerge([{ id: 1, content: 'a' }], [{ id: 1, content: 'a' }, { id: 2, content: 'b' }]);
     ok(merged.length === 2, 'dedupMerge 按 id 去重');
+
+    // 文件台账：无 FILES.md → ''（零痕迹）；有 → 内容流进 assembleContext 返回值
+    ok(assembleContext('A', 'x').filesLedger === '', '无台账实例 filesLedger=空串（朋友实例零痕迹）');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(dir, 'sandbox'), { recursive: true });
+    writeFileSync(join(dir, 'sandbox', 'FILES.md'), '# 文件台账\n- inbox/工资方案.md ｜ 2026-07-13 ｜ 长期 ｜ 工资分配方案\n', 'utf8');
+    const ctxL = assembleContext('A', 'x');
+    ok(ctxL.filesLedger.includes('inbox/工资方案.md'), '有台账时 filesLedger 带内容（注入渲染在 prompt 层）');
+
+    // 锚点带 pin_tier：钉一条 index 锚点，assembleContext 的 anchors 能带出 tier 字段
+    mem.pinFact({ entity: '购车', fact: '购车框架已立——先 memory_search 购车', tier: 'index' });
+    const ctxTier = assembleContext('A', 'x');
+    ok(ctxTier.anchors.some((a) => a.pin_tier === 'index' && a.fact.includes('购车框架')), 'anchors 携带 pin_tier=index（prompt 层分段渲染的输入）');
   } catch (e) {
     fail++;
     console.log('  ✗ selftest 异常: ' + e.stack);

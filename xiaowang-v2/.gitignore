@@ -1,5 +1,6 @@
 # 运行时密钥/数据/产物——绝不进库
 .env
+.env.glm
 node_modules/
 *.db
 *.db-wal
@@ -17,3 +18,10 @@ media/
 router.config.json
 friend.env
 tenants/
+# 租户身份含真人隐私（朋友的私密人设等）——server-only，绝不进库/防误推 GitHub。ziqi.json 是子淇自己的，保留跟踪。
+identities/friend.json
+
+# 发布到公开库用的本地密表（含线上 IP / 微信 id / 本机路径的真值）+ 转换暂存目录。
+# publish.mjs 自己要被公开，真值只能住在这个不进库的文件里。
+deploy/publish.local.json
+.publish-stage/

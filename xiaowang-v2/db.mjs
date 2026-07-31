@@ -200,7 +200,8 @@ export function initDb(dbPath = process.env.XW2_DB_PATH) {
       importance    REAL    NOT NULL DEFAULT 0.5,
       last_accessed INTEGER,
       access_count  INTEGER NOT NULL DEFAULT 0,
-      pinned        INTEGER NOT NULL DEFAULT 0
+      pinned        INTEGER NOT NULL DEFAULT 0,
+      pin_tier      TEXT    NOT NULL DEFAULT 'core'
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts (entity);`);
@@ -210,6 +211,13 @@ export function initDb(dbPath = process.env.XW2_DB_PATH) {
     db.exec(`ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;`);
   } catch (e) {
     /* duplicate column name → 已有 pinned，幂等无害 */
+  }
+  // pin_tier 列（锚点分级：core=每轮全文注入的常驻核心 / index=只注入一行索引、正文靠 memory_search 拉回）。
+  // 同 pinned 的双路迁移：新库 CREATE TABLE 已带，旧库 ALTER 补齐，重复执行幂等。
+  try {
+    db.exec(`ALTER TABLE facts ADD COLUMN pin_tier TEXT NOT NULL DEFAULT 'core';`);
+  } catch (e) {
+    /* duplicate column name → 已有 pin_tier，幂等无害 */
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_pinned ON facts (pinned);`);
 
@@ -435,6 +443,7 @@ function runSelftest() {
     // facts.pinned 列存在（锚点台账）
     const factCols = db.prepare(`PRAGMA table_info(facts)`).all().map((c) => c.name);
     ok(factCols.includes('pinned'), 'facts.pinned 列已建');
+    ok(factCols.includes('pin_tier'), 'facts.pin_tier 列已建（锚点分级 core/index）');
 
     // 索引存在
     const idxNames = db

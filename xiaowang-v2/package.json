@@ -2,10 +2,10 @@
   "name": "xiaowang-v2",
   "version": "2.0.0",
   "private": true,
-  "description": "小王 v2 — durable agentic worker. node:sqlite 内置 + 纯 fetch LLM，零运行时依赖。",
+  "description": "小王 v2 — durable agentic worker. node:sqlite 内置 + pi-ai 统一 LLM 层（LLM_ENGINE=raw 可回退纯 fetch）。",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "main": "main.mjs",
   "scripts": {
@@ -16,6 +16,7 @@
     "watchdog": "node --experimental-sqlite watchdog_cron.mjs"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "^0.82.0",
     "silk-wasm": "^3.7.1"
   },
   "optionalDependencies": {

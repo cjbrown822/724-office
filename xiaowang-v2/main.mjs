@@ -41,8 +41,9 @@ import { relayOutbox, enqueueOutbox, startAdapter } from './adapter.mjs';
 import { runAgentic } from './loop.mjs';
 import { assembleContext } from './context.mjs';
 import { initEsmSchema, esmDuePrompt, markEsmSent } from './esm.mjs';
-import { initRecurringSchema, dueRecurringJobs, markJobFired } from './recurring.mjs';
-import { morningBriefing, eveningBriefing, weatherBriefing } from './weather.mjs';
+import { initRecurringSchema, dueRecurringJobs, markJobFired, sweepExpiredJobs } from './recurring.mjs';
+import { initTodoSchema, rolloverSweep as todoRolloverSweep } from './todo.mjs';
+import { morningBriefing, eveningBriefing, weatherBriefing, ADCODE } from './weather.mjs';
 import { IDENTITY } from './identity.mjs';
 
 // 单 tick 最多执行的到期任务数：限制一拍跑太久（每个任务可能跑完整 agentic 循环）拖垮心跳/relay。
@@ -56,6 +57,11 @@ const TICK_INTERVAL_MS = Number(TICK_MS || 5000);
 // worker interval 句柄，模块级持有以便优雅退出 clearInterval。
 let _tickTimer = null;
 let _ticking = false; // 防重入：上一 tick 还在 await（relayOutbox 慢）时跳过本 tick
+
+// ESM 主动打卡（晨/晚自检 + 周日回顾）总开关：per-tenant，默认开。
+// 设 ESM_ENABLED=0 的实例整块跳过排程——如给朋友的分身关掉早晚健康自检（那是子淇自己的追踪工具）。
+// 只关"主动排程"这一步；# 快记等入站处理不受影响（无 pending 打卡时 record_checkin 本就不触发）。
+const ESM_ENABLED = process.env.ESM_ENABLED !== '0';
 
 // ---------------------------------------------------------------------
 // 单次 tick：四步顺序 + 每步 try/catch 隔离（致命纪律：失败要响不静默吞）。
@@ -110,10 +116,11 @@ async function tick() {
   }
 
   // ②.5 ESM 排程：到点(晨08:30/晚22:30/周日回顾)入 outbox + 设 pending。确定性、便宜，每拍查；同 tick 由 ③ relay 发出。
-  try {
+  //   ESM_ENABLED=0 的实例（如朋友分身）整块跳过——不给她发早晚打卡。
+  if (ESM_ENABLED) try {
     const esmDue = esmDuePrompt(getDb());
     if (esmDue && esmDue.content) {
-      const target = process.env.WECOM_TARGET_ID || process.env.OWNER_ID || '';
+      const target = process.env.OWNER_ID || process.env.WECOM_TARGET_ID || ''; // OWNER_ID 单一真相源（防收发 id 分叉漏发，见 tools send_message 注释）
       if (target) {
         const norm = ['wecom', String(target), String(esmDue.content), String(esmDue.dedupTag || '')]
           .map((p) => String(p ?? '').trim()).join(' ');
@@ -134,7 +141,12 @@ async function tick() {
   //   builtin(天气)直接拼文案入 outbox（确定性、无 AI 味）；agentic 派 task 走 runDueTasks。
   //   每拍查、便宜；动作成功后才落标，当天不重触发（与 ESM 同纪律，失败下拍在补发窗内重试）。
   try {
-    const target = process.env.WECOM_TARGET_ID || process.env.OWNER_ID || '';
+    const target = process.env.OWNER_ID || process.env.WECOM_TARGET_ID || ''; // OWNER_ID 单一真相源（防收发 id 分叉漏发，见 tools send_message 注释）
+    // 生命周期：先清扫过期任务（until 截止日已过 → 自动禁用留痕），再判定到期。
+    // 保证"每天提醒直到周六"过了周六连触发都不会发生——不依赖模型到点自觉判断（原则2：结构不靠自觉）。
+    for (const ex of sweepExpiredJobs(getDb())) {
+      console.error('[recurring] job %d (%s) 截止日 %s 已过，自动停用', ex.id, ex.name, ex.expires_on);
+    }
     for (const job of dueRecurringJobs(getDb())) {
       try {
         if (job.kind === 'builtin') {
@@ -146,8 +158,15 @@ async function tick() {
           }
         } else {
           // agentic：派一个到期任务，由 runDueTasks 跑 message（小王到点自己做事）。
+          // payload 带上周期来源（id/名字/创建时刻/截止日）：runScheduledTask 用它锚定原文里的相对日期、
+          // 给触发会话"过时就自己停掉"的抓手；cancel_schedule 也靠 recurring_id 把错取消实例的模型指回本体。
           const idem = createHash('sha256').update(`recurring ${job.id} ${job._date}`).digest('hex').slice(0, 16);
-          createTask({ kind: 'agentic', payload: { note: job.action.message, target }, idempotencyKey: idem, nextRunAt: nowMs() });
+          createTask({
+            kind: 'agentic',
+            payload: { note: job.action.message, target, recurring_id: job.id, recurring_name: job.name, recurring_created_at: job.created_at, recurring_until: job.expires_on || null },
+            idempotencyKey: idem,
+            nextRunAt: nowMs(),
+          });
         }
         markJobFired(getDb(), job.id, job._date);
         recurringFired++;
@@ -158,6 +177,17 @@ async function tick() {
     }
   } catch (e) {
     console.error('[worker] step recurring failed: %s', e.message);
+  }
+
+  // ②.7 待办跨天滚动（TODO_SECRET 配置的实例才有面板/表）：昨天没划掉的 open 待办挪到今天、
+  //   计数+1、留流水。确定性零 LLM；幂等（同日重复扫无事发生）；API 读前另有懒扫双保险，
+  //   这里保证"半夜过零点后哪怕没人打开面板，清单也已经是今天的样子"。
+  if (process.env.TODO_SECRET) try {
+    for (const r of todoRolloverSweep(getDb())) {
+      console.error('[todo] #%d (%s) 从 %s 滚动到今天（第 %d 次挂账）', r.id, r.title, r.scheduled_day, r.rollover_count + 1);
+    }
+  } catch (e) {
+    console.error('[worker] step todo rollover failed: %s', e.message);
   }
 
   // ③ relay outbox：扫 pending → 真发 → 标 sent（fetch 在 tx 外，致命纪律③）。
@@ -197,7 +227,7 @@ async function handleDueTimer(t) {
   }
 
   // 纯提醒：入 outbox 直发。dedup_hash 按 conventions：[channel,target,content,taskId??'']。
-  const target = payload.target || process.env.WECOM_TARGET_ID || '';
+  const target = payload.target || process.env.OWNER_ID || process.env.WECOM_TARGET_ID || '';
   const content = payload.content || payload.message || '（定时提醒）';
   if (!target) {
     console.error('[worker] timer id=%s has no target, skip outbox', t.id);
@@ -281,15 +311,32 @@ async function runScheduledTask(task) {
   // schedule_task 把 payload.target 存成 ctx.sessionId='wecom:<id>'（带前缀）。发送给企微的 toId 要裸 id，
   // 故剥掉 'wecom:' 前缀再用；缺失则回落 owner。sessionId 仍用带前缀的会话格式（喂 runAgentic / 召回隔离）。
   const rawTarget = String(payload.target || '');
-  const target = rawTarget.replace(/^wecom:/, '').trim() || process.env.WECOM_TARGET_ID || process.env.OWNER_ID || '';
+  const target = rawTarget.replace(/^wecom:/, '').trim() || process.env.OWNER_ID || process.env.WECOM_TARGET_ID || '';
   const sessionId = rawTarget.startsWith('wecom:') ? rawTarget : (target ? `wecom:${target}` : 'scheduled');
   const db = getDb();
 
   // 记下执行前 outbox 上界 id：用于判断本次跑有没有真的发出任何消息（兜底投递的依据）。
   const beforeMax = db.prepare(`SELECT COALESCE(MAX(id),0) m FROM outbox`).get().m;
 
+  // 周期任务触发：把创建日/截止日/自己的 recurring_id 喂进上下文（2026-07-23 修）。
+  // 为什么：任务原文是创建时冻结的字符串，"周六前"这类相对日期若不锚定创建日，触发会话会把它重新
+  // 锚定到本周 → 过期任务每周自动"续期"永不停止；且模型即使判断出过时，手里没有 recurring_id 也停不掉。
+  let recurringCtx = '';
+  if (payload.recurring_id) {
+    let createdStr = '未知日期';
+    if (payload.recurring_created_at) {
+      const cd = new Date(Number(payload.recurring_created_at) + 8 * 3600e3);
+      createdStr = `${cd.toISOString().slice(0, 10)}（周${'日一二三四五六'[cd.getUTCDay()]}）`;
+    }
+    recurringCtx =
+      `背景：这是周期任务「${payload.recurring_name || ''}」(recurring_id=${payload.recurring_id}) 的本次触发，该任务创建于 ${createdStr}` +
+      (payload.recurring_until ? `，截止 ${payload.recurring_until}（当天过后自动停）` : '，没设截止日') +
+      `。任务原文里的相对日期（"周六前"这类）以创建日为基准，不是以今天为基准。` +
+      `若这件事已经办完、或原定期限已过，不要再提醒——直接用 cancel_schedule (type=recurring, id=${payload.recurring_id}) 停掉它，再用一句话告诉${IDENTITY.ownerName}已停。\n`;
+  }
   const framing =
     `〔定时任务到点〕这是你之前为${IDENTITY.ownerName}排好的任务，现在到时间了，去把它做掉：\n「${note}」\n` +
+    recurringCtx +
     `多数情况下你只需把要提醒/告知${IDENTITY.ownerName}的话用 send_message 工具发给他（target=${target}）。` +
     `若任务需要先查点信息再说，可以调用工具。完成后用一句话回复即可，不要在正文里假装已发。`;
 
@@ -307,6 +354,8 @@ async function runScheduledTask(task) {
       recallWeak: ctx.recallWeak,
       pendingCheckin: null, // 定时任务不是打卡回复，不提供 record_checkin
       sinceLastMs: ctx.sinceLastMs, // 定时任务同样带时间感（"他半天没说话了"是有效背景）
+      filesLedger: ctx.filesLedger, // 台账同样在场：定时任务可能要"到点读某文件再说话"（发薪日→工资方案）
+      todayTodos: ctx.todayTodos, // 今日待办摘要同样在场：定时任务可能是"提醒他今天的待办"
     });
     reply = out && out.reply != null ? String(out.reply) : '';
     // 记一条 assistant episode：让"我到点提醒过你 X"这件事进记忆，将来可召回。
@@ -350,10 +399,39 @@ async function runRecurringBuiltin(action) {
 // startWorker() —— 契约签名。initDb → setInterval(tick)。
 // 立即跑一次 tick（不等首个 5s 间隔），让 heartbeat 尽快有值（watchdog 友好）。
 // ---------------------------------------------------------------------
+// 开机自检（团队原则2：让"悄悄失败"当场变响）。不 throw，只在日志喊——
+// 治两类曾经默默失败几个月才被发现的配置坑：
+//   ① 收/发 id 分叉：入站认 OWNER_ID、出站回落 WECOM_TARGET_ID，二者不一致 → 主动推送发错人（朋友事故）。
+//   ② 身份城市天气工具不支持：identity 写了 ADCODE 里没有的城市 → 该城天气推送每天默默失败。
+function preflightCheck() {
+  try {
+    let issues = 0;
+    const oid = String(process.env.OWNER_ID || '');
+    const tid = String(process.env.WECOM_TARGET_ID || '');
+    if (oid && tid && oid !== tid) {
+      issues++;
+      console.error('[preflight] ⚠️ OWNER_ID(%s) ≠ WECOM_TARGET_ID(%s)——两者应一致，否则主动推送可能发错人。已按 OWNER_ID 优先兜底，但请修正 env。', oid, tid);
+    }
+    if (!oid && !tid) { issues++; console.error('[preflight] ⚠️ OWNER_ID / WECOM_TARGET_ID 都没配，主动推送无收件人。'); }
+    const cities = [...(IDENTITY.weatherMorningCities || []), ...(IDENTITY.weatherEveningCities || [])];
+    const bad = [...new Set(cities)].filter((c) => c && !ADCODE[c]);
+    if (bad.length) {
+      issues++;
+      console.error('[preflight] ⚠️ 身份配的城市天气工具不支持：%s（ADCODE 现有 %s）——该城天气会查不到。去 weather.mjs 的 ADCODE 补 adcode。', bad.join('/'), Object.keys(ADCODE).join('/'));
+    }
+    // 成功也吭一声：静默成功和"根本没跑"在日志里长一样，出事时无法区分（原则4 可观测）。
+    if (!issues) console.error('[preflight] ok：收发同源(owner=%s)、身份城市(%s)天气全可用。', oid || '(未配)', [...new Set(cities)].join('/') || '(无)');
+  } catch (e) {
+    console.error('[preflight] 自检本身出错（不影响启动）: %s', e.message);
+  }
+}
+
 export function startWorker() {
   initDb();
   initEsmSchema(getDb()); // ESM 表(esm_raw/esm_coded/daily_events) + bot_state，idempotent
   initRecurringSchema(getDb()); // recurring_jobs 表（周期任务：天气播报等），idempotent
+  if (process.env.TODO_SECRET) initTodoSchema(getDb()); // 待办面板表（配置了 secret 的实例才建，未开通实例库里零痕迹）
+  preflightCheck(); // 配置自检（收发 id 分叉 / 身份城市不支持）——响而非静默
   if (_tickTimer) return; // 幂等：已启动不重复
   // 立即一拍，随后周期。
   tick().catch((e) => console.error('[worker] initial tick failed: %s', e.message));
@@ -379,7 +457,7 @@ function stopWorker() {
 // rawUserInput：成串消息装配时主人的纯原话（不含时间脚手架/图片描述），用于召回检索词 +
 //   record_checkin 等不可逆登记；null=单条直通，与 userInput 相同。
 // ---------------------------------------------------------------------
-export async function handleIncoming({ sessionId, userInput, rawUserInput = null }) {
+export async function handleIncoming({ sessionId, userInput, rawUserInput = null, deepthink = false, voice = false, onDelta = null }) {
   // ① 先组装上下文：此刻 userInput 尚未入库 → recentTurns 不含它；userInput 只在 loop 末尾注入一次（杜绝双注入）。
   //    召回检索词用纯原话（装配脚手架稀释 FTS 命中）；纯图轮原话为 '' → 回退用图片描述当检索词（|| 非 ??）。
   const ctx = assembleContext(sessionId, rawUserInput || userInput);
@@ -401,6 +479,11 @@ export async function handleIncoming({ sessionId, userInput, rawUserInput = null
       recallWeak: ctx.recallWeak,
       pendingCheckin: ctx.pendingCheckin, // 原则11：有待回打卡时让模型自己判断是否登记（record_checkin）
       sinceLastMs: ctx.sinceLastMs, // 轮间时间事实：进 system「现在」段
+      filesLedger: ctx.filesLedger, // 沙箱文件台账（索引层）：他有哪些文件每轮在场
+      todayTodos: ctx.todayTodos, // 今日待办摘要（索引层）：他今天要做什么每轮在场，详情靠 todo_list 拉
+      deepthink, // 深思模式（adapter 口令态判定后传入）：思考态深思队伍 + 思维链回传 + prompt 状态段
+      voice, // 语音轮（/voice 入口传入）：只改 system 段表达约束，记忆/工具/护栏与微信轮完全同一套
+      onDelta, // 语音流式：逐 token 回调，adapter 攒成整句 SSE 推给音箱
     });
     reply = out && out.reply != null ? out.reply : '';
   } catch (e) {
@@ -568,9 +651,11 @@ async function selftest() {
     }
     return { content: '已提醒子淇喝水。', toolCalls: [] };
   });
-  const schedRes = await callTool('schedule_task', { note: '记得喝水', delay_ms: -1000 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
+  // 工具只收未来时刻（人类单位护栏）；测"到期执行"=先建未来任务、再回拨 next_run_at 模拟时间流逝。
+  const schedRes = await callTool('schedule_task', { note: '记得喝水', delay_minutes: 5 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
   ok(schedRes.ok && schedRes.result.task_id > 0, 'schedule_task 建到期任务返回 task_id');
   const schedTaskId = schedRes.result.task_id;
+  db.prepare(`UPDATE tasks SET next_run_at=? WHERE id=?`).run(nowMs() - 1000, schedTaskId);
   await tick(); // runDueTasks 应认领并执行该到期任务
   const taskRow = db.prepare(`SELECT status FROM tasks WHERE id=?`).get(schedTaskId);
   ok(taskRow && taskRow.status === 'done', `到期任务被 runDueTasks 真执行并标 done（旧代码会卡 pending→dead；实际=${taskRow && taskRow.status}）`);
@@ -579,8 +664,9 @@ async function selftest() {
 
   // 8) 结构性兜底必达：另排一个任务，mock 只回文本不发消息 → 兜底投递 reply，保证提醒不丢。
   llm.setMockHandler(() => ({ content: '到点了，提醒你那件事。', toolCalls: [] }));
-  const schedRes2 = await callTool('schedule_task', { note: '兜底测试', delay_ms: -2000 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
+  const schedRes2 = await callTool('schedule_task', { note: '兜底测试', delay_minutes: 5 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
   const schedTaskId2 = schedRes2.result.task_id;
+  db.prepare(`UPDATE tasks SET next_run_at=? WHERE id=?`).run(nowMs() - 2000, schedTaskId2);
   await tick();
   const taskRow2 = db.prepare(`SELECT status FROM tasks WHERE id=?`).get(schedTaskId2);
   ok(taskRow2 && taskRow2.status === 'done', '兜底路径任务也标 done');
@@ -594,7 +680,8 @@ async function selftest() {
     if (!hasToolResult) return { content: '', toolCalls: [{ id: 'cr1', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ content: '幂等提醒X' }) } }] };
     return { content: 'ok', toolCalls: [] };
   });
-  const idemTask = (await callTool('schedule_task', { note: '幂等提醒X', delay_ms: -1000 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` })).result.task_id;
+  const idemTask = (await callTool('schedule_task', { note: '幂等提醒X', delay_minutes: 5 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` })).result.task_id;
+  db.prepare(`UPDATE tasks SET next_run_at=? WHERE id=?`).run(nowMs() - 1000, idemTask);
   await tick(); // 首跑
   db.prepare(`UPDATE tasks SET status='pending', heartbeat_at=NULL, next_run_at=? WHERE id=?`).run(nowMs() - 1000, idemTask); // 模拟崩溃后被 recover 退回 pending
   await tick(); // 重跑
@@ -666,9 +753,45 @@ async function selftest() {
   const csRes = await callTool('cancel_schedule', { type: 'recurring', id: recId }, {});
   ok(csRes.ok && csRes.result.cancelled === 'recurring', 'cancel_schedule 停掉周期任务');
   ok(!(await callTool('list_schedules', {}, {})).result.recurring.some((j) => j.id === recId), '取消后不再列出（enabled=0 被过滤）');
+  //  12b) 同名复活（修死锁：取消过的名字必须能重建，否则被禁用行永久挡路且模型看不见）。
+  const srRevive = await callTool('schedule_recurring', { name: '测试吃药提醒', time: '21:30', task: '提醒子淇吃药(新)' }, {});
+  ok(srRevive.ok && srRevive.result.recurring_id === recId && /重新启用/.test(srRevive.result.note), '取消过的同名任务→原地复活（同 id，不新增行）');
+  ok((await callTool('list_schedules', {}, {})).result.recurring.some((j) => j.id === recId && /21:30/.test(j.schedule)), '复活后按新时刻列出');
+  await callTool('cancel_schedule', { type: 'recurring', id: recId }, {}); // 清场，别影响后面的用例
+
+  //  12b-2) 调度生命周期（2026-07-23 修"过 DDL 继续天天响"）：until 入库可见、过期拒收、错取消实例被指回本体。
+  const srUntil = await callTool('schedule_recurring', { name: '测试限期催办', time: '09:00', task: '2099-01-02 前搞定X', until: '2099-01-02' }, {});
+  ok(srUntil.ok && srUntil.result.until === '2099-01-02' && /自动停/.test(srUntil.result.note), 'schedule_recurring 带 until→回执讲明到期自动停');
+  const limId = srUntil.result.recurring_id;
+  ok((await callTool('list_schedules', {}, {})).result.recurring.some((j) => j.id === limId && j.until === '2099-01-02'), 'list_schedules 周期任务带 until（截止对模型可见）');
+  ok(db.prepare('SELECT expires_on FROM recurring_jobs WHERE id=?').get(limId).expires_on === '2099-01-02', 'until 落库 expires_on');
+  const srPast = await callTool('schedule_recurring', { name: '测试过期截止', time: '09:00', task: 'x', until: '2020-01-01' }, {});
+  ok(srPast.ok === false && /过去/.test(srPast.error), 'until 已是过去日期→拒收');
+  //  周期触发实例(done、payload 带 recurring_id)被错拿去取消 → 报错指回 type=recurring 本体（修"撞死胡同后放弃"）
+  const inst = createTask({ kind: 'agentic', payload: { note: '限期催办实例', target: 'x', recurring_id: limId, recurring_name: '测试限期催办' }, nextRunAt: nowMs() });
+  db.prepare(`UPDATE tasks SET status='done', result='{}' WHERE id=?`).run(inst.taskId);
+  const csInst = await callTool('cancel_schedule', { type: 'task', id: inst.taskId }, {});
+  ok(csInst.ok === false && new RegExp(`type=recurring id=${limId}`).test(csInst.error), '取消已 done 的周期实例→报错给修复指引（指回周期本体 id）');
+  await callTool('cancel_schedule', { type: 'recurring', id: limId }, {}); // 清场
+
+  //  12c) schedule_task 时间护栏（修"立刻提醒"事故：秒级 epoch / 分钟当毫秒 / 过去时刻，一律拒收回灌）。
+  const stMiss = await callTool('schedule_task', { note: '缺时间' }, {});
+  ok(stMiss.ok === false && /delay_minutes/.test(stMiss.error), '不带时间参数→拒收，错误信息教正确用法');
+  const stNeg = await callTool('schedule_task', { note: '负数', delay_minutes: -5 }, {});
+  ok(stNeg.ok === false, 'delay_minutes 负数→拒收');
+  const stHuge = await callTool('schedule_task', { note: '疑似毫秒', delay_minutes: 3600000 }, {});
+  ok(stHuge.ok === false && /单位/.test(stHuge.error), '超一年的 delay_minutes→拒收并提示确认单位（抓毫秒误传）');
+  const stPast = await callTool('schedule_task', { note: '过去时刻', at: '2020-01-01 08:00' }, {});
+  ok(stPast.ok === false && /已过去/.test(stPast.error), "at 全日期已过去→拒收");
+  const stHm = await callTool('schedule_task', { note: 'HH:MM 语义', at: '08:00' }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
+  ok(stHm.ok && stHm.result.fire_at > nowMs() && stHm.result.fire_at - nowMs() <= 24 * 3600e3, "at 'HH:MM' 恒解析成未来 24h 内（已过算明天）");
+  const stMin = await callTool('schedule_task', { note: '一小时后', delay_minutes: 60 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
+  const dMin = stMin.result.fire_at - nowMs();
+  ok(stMin.ok && dMin > 59 * 60e3 && dMin < 61 * 60e3 && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} CST$/.test(stMin.result.fire_at_cst), 'delay_minutes=60 → 真的一小时后 + 返回人类可读时刻');
+  for (const r of [stHm, stMin]) db.prepare(`UPDATE tasks SET status='done', result='{"cancelled":true}' WHERE id=?`).run(r.result.task_id); // 清场
 
   // 一次性提醒的列出 + 取消：schedule_task 建未来任务 → list_schedules.onetime 含它 → cancel → 标 done(cancelled)。
-  const stRes = await callTool('schedule_task', { note: '一次性测试提醒', delay_ms: 3600000 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
+  const stRes = await callTool('schedule_task', { note: '一次性测试提醒', delay_minutes: 60 }, { sessionId: `wecom:${process.env.WECOM_TARGET_ID}` });
   const oneId = stRes.result.task_id;
   ok((await callTool('list_schedules', {}, {})).result.onetime.some((t) => t.id === oneId && /一次性测试提醒/.test(t.note)), 'list_schedules 列出待触发的一次性提醒');
   const csTask = await callTool('cancel_schedule', { type: 'task', id: oneId }, {});
@@ -676,6 +799,25 @@ async function selftest() {
   const oneRow = db.prepare('SELECT status, result FROM tasks WHERE id=?').get(oneId);
   ok(oneRow.status === 'done' && JSON.parse(oneRow.result).cancelled === true, '取消的一次性任务标 done(cancelled)，runDueTasks 不再跑它');
   ok((await callTool('cancel_schedule', { type: 'task', id: oneId }, {})).ok === false, '再次取消已 done 的任务被拒（状态守卫）');
+  // 已结束任务可见（修"排了但触发过"被模型误诊为"没排上"）：recent_done 列出刚取消的任务并带 cancelled 标。
+  const lsDone = await callTool('list_schedules', {}, {});
+  ok(lsDone.ok && lsDone.result.recent_done.some((t) => t.id === oneId && t.cancelled === true && /一次性测试提醒/.test(t.note)), 'list_schedules.recent_done 列出已结束任务（含取消标记，供"怎么没提醒我"排查）');
+
+  //  12d) report_to_operator（多租户反馈闭环）：上报锁定运营者 + notes 留副本 + 去重。
+  //  注册在 tools.mjs import 时按 OPERATOR_ID 定，所以要在进程 env 里带 OPERATOR_ID 跑本 selftest 才覆盖；
+  //  未带则跳过（提示补跑），不假红。
+  if (process.env.OPERATOR_ID && process.env.OPERATOR_ID !== String(process.env.WECOM_TARGET_ID || '')) {
+    const rto = await callTool('report_to_operator', { content: '她想要支持西安天气' }, { sessionId: 'wecom:friendSelftest' });
+    ok(rto.ok && rto.result.outbox_id > 0, 'report_to_operator 上报入 outbox');
+    const rtoRow = db.prepare('SELECT target, content FROM outbox WHERE id=?').get(rto.result.outbox_id);
+    ok(rtoRow && rtoRow.target === process.env.OPERATOR_ID, '上报收件人 == OPERATOR_ID（结构锁定，非 owner 非第三方）');
+    ok(/实例·小王上报/.test(rtoRow.content) && /西安天气/.test(rtoRow.content), '上报带实例来源前缀');
+    ok(db.prepare("SELECT COUNT(*) c FROM notes WHERE source='report' AND content LIKE '%西安天气%'").get().c === 1, '上报副本落本租户 notes 黑匣子');
+    const rto2 = await callTool('report_to_operator', { content: '她想要支持西安天气' }, { sessionId: 'wecom:friendSelftest' });
+    ok(rto2.ok && rto2.result.deduped === true, '同内容重报被去重（不重复打扰运营者）');
+  } else {
+    console.log('  - skip report_to_operator 用例（跑法：OPERATOR_ID=op-test XW2_DB_PATH=<新临时库> node main.mjs --selftest）');
+  }
 
   console.log(`\nPASS ${pass} / FAIL ${fail}`);
   process.exit(fail ? 1 : 0);

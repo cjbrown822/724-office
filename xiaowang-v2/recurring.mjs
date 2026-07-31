@@ -37,10 +37,13 @@ export function initRecurringSchema(db = getDb()) {
       action          TEXT    NOT NULL DEFAULT '{}',    -- builtin:{handler,params} / agentic:{message}
       enabled         INTEGER NOT NULL DEFAULT 1,
       last_fired_date TEXT,                             -- 'YYYY-MM-DD' CST，当天只触发一次
+      expires_on      TEXT,                             -- 'YYYY-MM-DD' CST 截止日(含当天)；NULL=无限期。过期由 sweepExpiredJobs 自动禁用
       created_at      INTEGER NOT NULL
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recurring_enabled ON recurring_jobs (enabled);`);
+  // 老库迁移：expires_on 列 2026-07-23 加（调度生命周期修复），已有该列则忽略。
+  try { db.exec(`ALTER TABLE recurring_jobs ADD COLUMN expires_on TEXT`); } catch { /* 列已存在 */ }
   return db;
 }
 
@@ -56,6 +59,7 @@ export function dueRecurringJobs(db = getDb()) {
   const rows = db.prepare(`SELECT * FROM recurring_jobs WHERE enabled = 1`).all();
   const due = [];
   for (const r of rows) {
+    if (r.expires_on && date > r.expires_on) continue; // 已过截止日：不触发（禁用留痕由 sweepExpiredJobs 做）
     if (r.dow != null && r.dow !== dow) continue;
     const late = nowMin - hmToMin(r.fire_hm);
     if (late < 0 || late > MAX_CATCHUP_LATE_MIN) continue;
@@ -63,6 +67,22 @@ export function dueRecurringJobs(db = getDb()) {
     due.push({ ...r, action: parseAction(r.action), _date: date });
   }
   return due;
+}
+
+// ---- 过期清扫（写操作，与 dueRecurringJobs 的纯读判定分离；main 每拍先扫再判定到期）。 ----
+// 为什么存在：2026-07-23 事故——"每天提醒直到周六"只能建成无限期任务，过了 DDL 继续天天响，
+// 且触发会话会把原文里的相对日期("周六前")重新锚定到本周 → 任务永不过期。
+// 禁用(enabled=0)而非删行：与 cancel 同纪律，留台账可对账/可复活。返回被禁用的行供 main 记日志。
+export function sweepExpiredJobs(db = getDb()) {
+  const { date } = cstParts();
+  const rows = db.prepare(
+    `SELECT id, name, expires_on FROM recurring_jobs WHERE enabled = 1 AND expires_on IS NOT NULL AND expires_on < ?`
+  ).all(date);
+  if (!rows.length) return [];
+  tx((d) => {
+    for (const r of rows) d.prepare(`UPDATE recurring_jobs SET enabled = 0 WHERE id = ?`).run(r.id);
+  });
+  return rows;
 }
 
 // 触发后落标（当天只触发一次）。与 enqueue/派 task 解耦：main 先成功执行动作再调它（失败则下拍重试）。
@@ -73,27 +93,38 @@ export function markJobFired(db, id, date) {
 }
 
 // ---- 管理接口（供 seed 脚本 / 未来的 schedule_recurring 工具用） ----
-export function addJob(db, { name, fireHm, dow = null, kind = 'agentic', action = {} }) {
+export function addJob(db, { name, fireHm, dow = null, kind = 'agentic', action = {}, expiresOn = null }) {
   if (!name || !fireHm) throw new Error('addJob: name 与 fireHm 必填');
   if (!/^\d{1,2}:\d{2}$/.test(fireHm)) throw new Error(`addJob: fireHm 需 'HH:MM'，得到 ${fireHm}`);
   if (kind !== 'agentic' && kind !== 'builtin') throw new Error(`addJob: kind 须 agentic|builtin`);
+  if (expiresOn != null && !/^\d{4}-\d{2}-\d{2}$/.test(expiresOn)) throw new Error(`addJob: expiresOn 需 'YYYY-MM-DD'，得到 ${expiresOn}`);
   return tx((d) => {
     const info = d.prepare(
-      `INSERT INTO recurring_jobs (name, fire_hm, dow, kind, action, enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?)`
-    ).run(name, fireHm, dow, kind, JSON.stringify(action ?? {}), nowMs());
+      `INSERT INTO recurring_jobs (name, fire_hm, dow, kind, action, enabled, expires_on, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+    ).run(name, fireHm, dow, kind, JSON.stringify(action ?? {}), expiresOn, nowMs());
     return Number(info.lastInsertRowid);
   });
 }
 
 export function listJobs(db = getDb()) {
-  return db.prepare(`SELECT id,name,fire_hm,dow,kind,enabled,last_fired_date FROM recurring_jobs ORDER BY fire_hm`).all();
+  return db.prepare(`SELECT id,name,fire_hm,dow,kind,enabled,last_fired_date,expires_on,created_at FROM recurring_jobs ORDER BY fire_hm`).all();
 }
 export function removeJob(db, id) {
   return tx((d) => d.prepare(`DELETE FROM recurring_jobs WHERE id = ?`).run(id).changes);
 }
 export function setEnabled(db, id, enabled) {
   return tx((d) => d.prepare(`UPDATE recurring_jobs SET enabled = ? WHERE id = ?`).run(enabled ? 1 : 0, id).changes);
+}
+// 复活一个被取消(enabled=0)的任务并更新时间/内容：同名重建走这里（原地 UPDATE，不新增行）。
+// 为什么需要：cancel 是禁用不删行，同名新建若一律被挡，"取消过的名字"就永远建不回来（线上真死锁过——
+// list_schedules 又只显示启用中的，模型连挡路的是谁都看不见）。last_fired_date 清空=按新配置重新起算。
+export function reviveJob(db, id, { fireHm, dow = null, action = {}, expiresOn = null }) {
+  if (!/^\d{1,2}:\d{2}$/.test(fireHm || '')) throw new Error(`reviveJob: fireHm 需 'HH:MM'，得到 ${fireHm}`);
+  if (expiresOn != null && !/^\d{4}-\d{2}-\d{2}$/.test(expiresOn)) throw new Error(`reviveJob: expiresOn 需 'YYYY-MM-DD'，得到 ${expiresOn}`);
+  return tx((d) => d.prepare(
+    `UPDATE recurring_jobs SET fire_hm = ?, dow = ?, action = ?, expires_on = ?, enabled = 1, last_fired_date = NULL WHERE id = ?`
+  ).run(fireHm, dow, JSON.stringify(action ?? {}), expiresOn, id).changes);
 }
 
 // =====================================================================
@@ -145,6 +176,22 @@ if (process.argv.includes('--selftest') && import.meta.url === pathToFileURL(pro
 
     // removeJob
     ok(removeJob(conn, wid) === 1 && listJobs(conn).length === 1, 'removeJob 删除生效');
+
+    // 生命周期（expiresOn）：截止日当天(含)仍触发；过后不触发且被 sweep 自动禁用（留行可对账）
+    const lim = addJob(conn, { name: '限期提醒', fireHm: '08:30', dow: null, kind: 'agentic', action: { message: '周六前搞定X' }, expiresOn: '2026-06-26' });
+    db.__setClockForTest(() => Date.parse('2026-06-26T00:45:00Z')); // 截止日当天 08:45 CST
+    ok(dueRecurringJobs(conn).some((j) => j.id === lim), 'expiresOn 截止日当天(含)仍触发');
+    ok(sweepExpiredJobs(conn).length === 0, '截止日当天 sweep 不禁用');
+    db.__setClockForTest(() => Date.parse('2026-06-27T00:45:00Z')); // 次日
+    ok(!dueRecurringJobs(conn).some((j) => j.id === lim), '过截止日不再触发（due 侧兜底）');
+    const swept = sweepExpiredJobs(conn);
+    ok(swept.length === 1 && swept[0].id === lim, 'sweep 禁用过期任务并返回台账');
+    ok(listJobs(conn).find((j) => j.id === lim).enabled === 0, '过期任务 enabled=0 留行不删');
+    ok(sweepExpiredJobs(conn).length === 0, 'sweep 幂等（已禁用的不重复报）');
+    // revive 带新截止日：expires_on 更新、重新启用
+    ok(reviveJob(conn, lim, { fireHm: '09:00', action: { message: '新一轮' }, expiresOn: '2026-07-04' }) === 1, 'reviveJob 接受 expiresOn');
+    const revived = listJobs(conn).find((j) => j.id === lim);
+    ok(revived.enabled === 1 && revived.expires_on === '2026-07-04', 'revive 后新截止日生效');
 
     db.__setClockForTest(null);
   } catch (e) {

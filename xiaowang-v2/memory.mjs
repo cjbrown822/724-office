@@ -117,7 +117,7 @@ export function retrieve(query, k = 8, opts = {}) {
   if (mode === 'fts5') {
     try {
       const ftsHits = retrieveFts(conn, q, limit, entity, sessionId);
-      // CJK 兜底：unicode61 分词器把整段中文当一个 token，子串（如 "手环"）召不回，
+      // CJK 兜底：unicode61 分词器把整段中文当一个 token，子串（如 "药盒"）召不回，
       // 返回 0 命中。此时 LIKE 仍能子串匹配——FTS 空手而归就回退 LIKE，保证中文召回不丢。
       // （英文/有命中场景维持 FTS 的 BM25×recency 排序，不受影响。）
       if (ftsHits.length > 0) return ftsHits;
@@ -400,18 +400,33 @@ export function topFacts(entity = null, k = 10) {
  * 幂等：同一 fact 原文已有未失效的 pinned 行 → 返回现有 id，不重复插（防重试/口误双发）。
  * 注：本函数不做矛盾消解（新锚点与旧锚点冲突时的 supersede 留给"删/留策略"那轮，属已知 backlog）。
  *
- * @param {{entity?:string|null, fact:string}} f
- * @returns {{id:number, deduped:boolean}}
+ * 锚点分级（渐进式记忆的常驻层纪律，防"锚点层长成塞满的 System Prompt"）：
+ *   tier='core'  = 身份/铁律类，每轮全文注入——稀缺席位，数量硬上限 CORE_PIN_CAP（结构挡膨胀，原则2/8）。
+ *   tier='index' = 专题守则/清单/框架类，只注入一行索引，正文靠 memory_search 拉回——行长硬上限，逼它是"索引"不是"内容"。
+ *
+ * @param {{entity?:string|null, fact:string, tier?:'core'|'index'}} f
+ * @returns {{id:number, deduped:boolean, tier:string}}
  */
-export function pinFact({ entity = null, fact } = {}) {
+export const CORE_PIN_CAP = 12; // core 锚点席位上限：满了必须降级 index 或先 unpin（导出供工具层报错文案引用）
+const INDEX_PIN_MAXLEN = 120; // index 是索引行不是正文：超长说明内容该放 notes/文件，行里只写"是什么+去哪拉"
+
+export function pinFact({ entity = null, fact, tier = 'core' } = {}) {
   const text = (fact ?? '').toString().trim();
   if (!text) throw new Error('[memory] pinFact: fact is required and non-empty');
-  // facts.entity 是 NOT NULL（db schema）；但 pin 常无天然 entity（如"记住我对花粉过敏"），
+  if (tier !== 'core' && tier !== 'index') {
+    throw new Error(`[memory] pinFact: tier 必须是 core 或 index（收到 '${tier}'）`);
+  }
+  // facts.entity 是 NOT NULL（db schema）；但 pin 常无天然 entity（如"记住我对青霉素过敏"），
   // 兜底成空串而非 null——空串满足 NOT NULL，且 prompt 渲染 `f.entity ? ...` 对空串友好（不加前缀）。
   const ent = (entity ?? '').toString().trim();
   // pinned fact 每轮注入 system 头部、永久驻留，过长=永久 token 税；超 200 字拒绝，让模型精简成一句话。
   if (text.length > 200) {
     throw new Error('[memory] pinFact: fact 过长（>200字），锚点应是一句话，请精简后再钉');
+  }
+  if (tier === 'index' && text.length > INDEX_PIN_MAXLEN) {
+    throw new Error(
+      `[memory] pinFact: 索引行过长（>${INDEX_PIN_MAXLEN}字）。index 锚点只写"是什么+去哪拉正文"（如 memory_search 的关键词），正文放 notes/文件`,
+    );
   }
 
   return tx((conn) => {
@@ -419,18 +434,30 @@ export function pinFact({ entity = null, fact } = {}) {
     const ex = conn
       .prepare(`SELECT id FROM facts WHERE fact = ? AND pinned = 1 AND superseded_by IS NULL`)
       .get(text);
-    if (ex) return { id: Number(ex.id), deduped: true };
+    if (ex) return { id: Number(ex.id), deduped: true, tier };
+
+    // core 席位硬上限：结构性挡"什么都钉成常驻"（原则2——不靠 prompt 自觉，靠写入时拒绝）。
+    if (tier === 'core') {
+      const n = conn
+        .prepare(`SELECT COUNT(*) AS c FROM facts WHERE pinned = 1 AND pin_tier = 'core' AND superseded_by IS NULL`)
+        .get().c;
+      if (n >= CORE_PIN_CAP) {
+        throw new Error(
+          `[memory] pinFact: core 锚点已满（${CORE_PIN_CAP} 条）。这条改钉 tier='index'（一行索引+正文可检索），或先 unpin 一条不再需要每轮在场的`,
+        );
+      }
+    }
 
     const now = nowMs();
     const info = conn
       .prepare(
         `INSERT INTO facts
            (entity, fact, source, confidence, created_at, valid_from,
-            superseded_by, importance, last_accessed, access_count, pinned)
-         VALUES (?, ?, 'user_said', 0.95, ?, ?, NULL, 0.9, NULL, 0, 1)`,
+            superseded_by, importance, last_accessed, access_count, pinned, pin_tier)
+         VALUES (?, ?, 'user_said', 0.95, ?, ?, NULL, 0.9, NULL, 0, 1, ?)`,
       )
-      .run(ent, text, now, now);
-    return { id: Number(info.lastInsertRowid), deduped: false };
+      .run(ent, text, now, now, tier);
+    return { id: Number(info.lastInsertRowid), deduped: false, tier };
   });
 }
 
@@ -459,22 +486,72 @@ export function unpinFact(fact) {
 
 /**
  * 锚点台账：pinned=1 的有效事实全量（确定性注入 system，防 tell #3 自相矛盾）。
- * 永不进有损摘要——硬状态与对话流物理剥离。按 importance 排，封顶 k 防失控。
- * @param {number} [k=12]
- * @returns {Array<{entity,fact,confidence,importance}>}
+ * 永不进有损摘要——硬状态与对话流物理剥离。带 pin_tier 供 prompt 层分段渲染
+ * （core=全文常驻段 / index=专题守则索引段）。core 排前、各按 importance 排；
+ * 封顶 k 防失控——core 有 CORE_PIN_CAP 硬上限，k 主要约束 index 行数（原则8）。
+ * @param {number} [k=60]
+ * @returns {Array<{entity,fact,confidence,importance,pin_tier}>}
  */
-export function pinnedFacts(k = 12) {
+export function pinnedFacts(k = 60) {
   const limit = Math.max(1, k | 0);
   const conn = getDb();
   return conn
     .prepare(
-      `SELECT entity, fact, confidence, importance
+      `SELECT entity, fact, confidence, importance, pin_tier
        FROM facts
        WHERE pinned = 1 AND superseded_by IS NULL
-       ORDER BY importance DESC, confidence DESC, id DESC
+       ORDER BY CASE WHEN pin_tier = 'index' THEN 1 ELSE 0 END,
+                importance DESC, confidence DESC, id DESC
        LIMIT ?`,
     )
     .all(limit);
+}
+
+/**
+ * searchFacts —— LIKE 检索 facts（含被降级 unpin 的锚点原文）。
+ * 渐进式记忆的按需层：index 锚点行承诺"正文用 memory_search 拉回"，这里是兑现处之一。
+ * 命中 fact 或 entity 均算；pinned 优先（钉过的更可能是要找的守则），再按 id 新优先。
+ * @param {string} query
+ * @param {number} [k=6]
+ * @returns {Array<{id,entity,fact,pinned}>}
+ */
+export function searchFacts(query, k = 6) {
+  const q = (query ?? '').trim();
+  if (q === '') return [];
+  const likeVal = '%' + escapeLike(q) + '%';
+  return getDb()
+    .prepare(
+      `SELECT id, entity, fact, pinned
+       FROM facts
+       WHERE superseded_by IS NULL
+         AND (fact LIKE ? ESCAPE '\\' OR entity LIKE ? ESCAPE '\\')
+       ORDER BY pinned DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(likeVal, likeVal, Math.max(1, k | 0));
+}
+
+/**
+ * searchNotes —— LIKE 检索 notes 黑匣子（#快记 + 归档正文的权威正本）。
+ * 此前 notes 对模型是只写黑洞（listNotes 只给 selftest 用）；索引锚点上线后正文常住这里，
+ * 必须可搜否则"先拉正文再回答"没有兑现路径。只读不改写，黑匣子不可逆性质不变。
+ * @param {string} query
+ * @param {number} [k=3]
+ * @returns {Array<{id,ts,content}>}
+ */
+export function searchNotes(query, k = 3) {
+  const q = (query ?? '').trim();
+  if (q === '') return [];
+  const likeVal = '%' + escapeLike(q) + '%';
+  return getDb()
+    .prepare(
+      `SELECT id, ts, content
+       FROM notes
+       WHERE content LIKE ? ESCAPE '\\'
+       ORDER BY ts DESC
+       LIMIT ?`,
+    )
+    .all(likeVal, Math.max(1, k | 0));
 }
 
 /**
@@ -638,7 +715,7 @@ async function runSelftest() {
     const idA = appendEpisode({
       ts: baseTs - 10 * MS_PER_DAY, // 10 天前
       role: 'user',
-      content: '子淇在一家公司做数据看板项目',
+      content: '子淇在某医疗公司做智能药盒数据看板',
       entity: 'work',
     });
     const idB = appendEpisode({
@@ -650,25 +727,25 @@ async function runSelftest() {
     const idC = appendEpisode({
       ts: baseTs - 2 * MS_PER_DAY,
       role: 'user',
-      content: '智能手环的数据看板要加一个趋势图',
+      content: '智能药盒的数据看板要加一个趋势图',
       entity: 'work',
     });
     ok(idA > 0 && idB > idA && idC > idB, 'appendEpisode 返回递增正整数 id');
 
-    // ---- retrieve：关键词召回（fts5 或 like 都该命中"手环"）----
-    const r1 = retrieve('手环', 5);
-    ok(Array.isArray(r1) && r1.length >= 1, `retrieve('手环') 命中至少 1 条 (got ${r1.length})`);
+    // ---- retrieve：关键词召回（fts5 或 like 都该命中"药盒"）----
+    const r1 = retrieve('药盒', 5);
+    ok(Array.isArray(r1) && r1.length >= 1, `retrieve('药盒') 命中至少 1 条 (got ${r1.length})`);
     ok(
       r1.every((x) => typeof x.score === 'number' && x.score >= 0),
       'retrieve 每条带非负 score',
     );
     ok(
-      r1.some((x) => x.content.includes('手环')),
-      'retrieve 命中内容含 "手环"',
+      r1.some((x) => x.content.includes('药盒')),
+      'retrieve 命中内容含 "药盒"',
     );
 
     // ---- retrieve top-k 上限 ----
-    const rTop = retrieve('手环', 1);
+    const rTop = retrieve('药盒', 1);
     ok(rTop.length <= 1, 'retrieve top-k 截断生效 (k=1 → ≤1 条)');
 
     // ---- entity boost：query 命中两条 work 内容，指定 entity=work 应让 work 条目排前 ----
@@ -694,7 +771,7 @@ async function runSelftest() {
     ok(stillThere.c === 3, 'episodes 表未被注入破坏（仍 3 行）');
 
     // ---- stageFact → facts_staging ----
-    const sid = stageFact({ entity: 'work', fact: '喜欢爬山', source: 'user_said' });
+    const sid = stageFact({ entity: 'work', fact: '月薪 3 万', source: 'user_said' });
     ok(sid > 0, 'stageFact 返回 staging id');
     const stRow = conn
       .prepare(`SELECT status, fact FROM facts_staging WHERE id = ?`)
@@ -726,7 +803,7 @@ async function runSelftest() {
       .prepare(`SELECT fact, confidence, importance, superseded_by FROM facts WHERE id = ?`)
       .get(fid);
     ok(
-      fRow && fRow.fact === '喜欢爬山' && fRow.confidence === 0.9 && fRow.superseded_by === null,
+      fRow && fRow.fact === '月薪 3 万' && fRow.confidence === 0.9 && fRow.superseded_by === null,
       'promoteFact 写入 facts（confidence/importance 正确，未 superseded）',
     );
     const stAfter = conn
@@ -745,18 +822,18 @@ async function runSelftest() {
 
     // ---- topFacts：只取有效（superseded_by IS NULL）----
     const tf = topFacts(null, 10);
-    ok(tf.length === 1 && tf[0].fact === '喜欢爬山', 'topFacts 取有效事实');
+    ok(tf.length === 1 && tf[0].fact === '月薪 3 万', 'topFacts 取有效事实');
     // 插入一条被 superseded 的事实，确认被过滤
     tx((c) => {
       c.prepare(
         `INSERT INTO facts (entity, fact, source, confidence, created_at, valid_from,
                             superseded_by, importance, last_accessed, access_count)
-         VALUES ('work', '旧爱好', 'user_said', 0.5, ?, ?, 1, 0.9, NULL, 0)`,
+         VALUES ('work', '旧工资', 'user_said', 0.5, ?, ?, 1, 0.9, NULL, 0)`,
       ).run(nowMs(), nowMs());
     });
     const tf2 = topFacts(null, 10);
     ok(
-      tf2.every((x) => x.fact !== '旧爱好'),
+      tf2.every((x) => x.fact !== '旧工资'),
       'topFacts 过滤掉已 superseded 的事实',
     );
     // entity 过滤
@@ -764,8 +841,8 @@ async function runSelftest() {
     ok(tfStudy.length === 0, 'topFacts entity 过滤生效（study 无事实）');
 
     // ---- pinFact：用户显式钉锚点（pinned=1，跳过 staging），幂等。放在 topFacts 断言之后，
-    //      避免多种一条 fact 污染上面"只有喜欢爬山一条"的断言。----
-    const pf = pinFact({ entity: '居住', fact: '现居上海市区' });
+    //      避免多种一条 fact 污染上面"只有月薪3万一条"的断言。----
+    const pf = pinFact({ entity: '居住', fact: '现居上海徐汇区' });
     ok(pf.id > 0 && pf.deduped === false, 'pinFact 返回新 id、首次非 deduped');
     const pinnedRow = conn
       .prepare(`SELECT pinned, source FROM facts WHERE id = ?`)
@@ -775,17 +852,17 @@ async function runSelftest() {
       'pinFact 写入 pinned=1 + source=user_said',
     );
     ok(
-      pinnedFacts(12).some((a) => a.fact === '现居上海市区'),
+      pinnedFacts(12).some((a) => a.fact === '现居上海徐汇区'),
       'pinFact 的事实立即进 pinnedFacts 锚点台账（对话里能新增锚点 = 裂缝二已通）',
     );
-    const pf2 = pinFact({ entity: '居住', fact: '现居上海市区' });
+    const pf2 = pinFact({ entity: '居住', fact: '现居上海徐汇区' });
     ok(pf2.id === pf.id && pf2.deduped === true, 'pinFact 同 fact 幂等去重（返回现有 id，不重复插）');
     let pinThrew = false;
     try { pinFact({ fact: '   ' }); } catch { pinThrew = true; }
     ok(pinThrew, 'pinFact 空 fact 抛错');
 
     // 阻断 bug 回归（审查抓到）：无 entity 也能 pin（facts.entity NOT NULL → 兜底空串）
-    const pfNoEnt = pinFact({ fact: '对花粉过敏' });
+    const pfNoEnt = pinFact({ fact: '对青霉素过敏' });
     ok(pfNoEnt.id > 0, 'pinFact 无 entity 也能成功（堵 entity NOT NULL 阻断 bug）');
     ok(
       conn.prepare(`SELECT entity FROM facts WHERE id = ?`).get(pfNoEnt.id)?.entity === '',
@@ -800,12 +877,47 @@ async function runSelftest() {
     ok(promoteFact(sidNoEnt) > 0, 'promoteFact 空 entity staging 不崩（同源兜底）');
 
     // unpinFact：精确匹配取消锚点（pin↔unpin 闭合"能纠正"）
-    ok(unpinFact('对花粉过敏').unpinned === true, 'unpinFact 精确匹配 → 取消成功');
+    ok(unpinFact('对青霉素过敏').unpinned === true, 'unpinFact 精确匹配 → 取消成功');
     ok(
-      !pinnedFacts(20).some((a) => a.fact === '对花粉过敏'),
+      !pinnedFacts(20).some((a) => a.fact === '对青霉素过敏'),
       'unpin 后该事实不再出现在锚点台账',
     );
     ok(unpinFact('压根没钉过的东西').unpinned === false, 'unpinFact 匹配不到 → unpinned=false（上层会列出当前锚点让对准）');
+
+    // ---- 锚点分级（pin_tier）----
+    const pfIdx = pinFact({ entity: '购车', fact: '购车框架已立——谈买车先 memory_search 购车 拉正文', tier: 'index' });
+    ok(pfIdx.id > 0 && pfIdx.tier === 'index', 'pinFact tier=index 成功');
+    ok(
+      pinnedFacts().some((a) => a.pin_tier === 'index' && a.fact.includes('购车框架')),
+      'pinnedFacts 返回 pin_tier（index 锚点可被 prompt 层分段渲染）',
+    );
+    ok(
+      pinnedFacts().every((a) => a.pin_tier === 'core' ? true : true) &&
+        pinnedFacts().findIndex((a) => a.pin_tier === 'index') >
+        pinnedFacts().findIndex((a) => a.pin_tier === 'core'),
+      'pinnedFacts core 排在 index 前（常驻段在头部强位）',
+    );
+    let tierThrew = false;
+    try { pinFact({ fact: 'x', tier: 'bogus' }); } catch { tierThrew = true; }
+    ok(tierThrew, 'pinFact 非法 tier 抛错');
+    let idxLongThrew = false;
+    try { pinFact({ fact: '长'.repeat(INDEX_PIN_MAXLEN + 1), tier: 'index' }); } catch { idxLongThrew = true; }
+    ok(idxLongThrew, `pinFact index 超 ${INDEX_PIN_MAXLEN} 字拒绝（索引行不是正文）`);
+    // core 席位硬上限：填满到 CORE_PIN_CAP 后再钉 core 必须被拒、钉 index 仍放行
+    const coreNow = pinnedFacts().filter((a) => a.pin_tier === 'core').length;
+    for (let i = coreNow; i < CORE_PIN_CAP; i++) pinFact({ fact: `填席位核心事实${i}` });
+    let capThrew = false;
+    try { pinFact({ fact: '第十三条核心' }); } catch (e) { capThrew = /core 锚点已满/.test(e.message); }
+    ok(capThrew, `core 锚点满 ${CORE_PIN_CAP} 条后拒钉（错误文案含改钉 index 的出路）`);
+    ok(pinFact({ fact: '满员后钉 index 不受限', tier: 'index' }).id > 0, 'core 满员不影响钉 index');
+
+    // ---- searchFacts / searchNotes（渐进式记忆的按需层）----
+    ok(searchFacts('购车').some((f) => f.fact.includes('购车框架')), 'searchFacts 命中 fact 文本');
+    // 被 unpin 的原文仍可搜（降级不丢内容——"忘得诚实"的另一半是"找得回来"）
+    unpinFact('购车框架已立——谈买车先 memory_search 购车 拉正文');
+    ok(searchFacts('购车').some((f) => f.fact.includes('购车框架') && f.pinned === 0), 'unpin 后的原文仍被 searchFacts 找回');
+    ok(searchFacts('') .length === 0 && searchNotes('').length === 0, '空 query 返回空数组（不整表倒灌）');
+    ok(Array.isArray(searchFacts('%_\\')), 'searchFacts LIKE 元字符安全（不崩不注入）');
 
     // ---- notes 黑匣子层 round-trip ----
     const nid = appendNote({ sessionId: 'wecom:test', content: '中午和老王吃饭聊了项目', source: 'hashtag' });
@@ -813,6 +925,10 @@ async function runSelftest() {
     ok(
       listNotes(10).some((n) => n.content === '中午和老王吃饭聊了项目' && n.session_id === 'wecom:test'),
       'listNotes 读回刚写的笔记（黑匣子可 round-trip）',
+    );
+    ok(
+      searchNotes('老王吃饭').some((n) => n.content.includes('中午和老王')),
+      'searchNotes 按关键词找回笔记（黑匣子不再是只写黑洞）',
     );
     let noteThrew = false;
     try { appendNote({ content: '   ' }); } catch { noteThrew = true; }

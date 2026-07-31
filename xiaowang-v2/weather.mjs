@@ -5,7 +5,7 @@
 // 走 LLM 反而不稳、还会夹带"记得带伞哦~"这类子淇极反感的 AI 味旁白（原则10）。
 // 这里直接打高德天气端点，按固定陈述式格式拼文案，零模型参与、可复现、便宜。
 //
-// KEY/能力恢复自旧小王（patch_capabilities.py）。优先读 .env 的 GAODE_KEY，留空则天气功能不可用，需自行申请。
+// KEY/能力恢复自旧小王（patch_capabilities.py）。优先读 .env 的 GAODE_KEY，回落已验证可用的旧 key。
 // 依赖方向：本模块零业务依赖（只 fetch + 纯函数格式化），可整块删除（原则6）。
 // =====================================================================
 
@@ -30,13 +30,14 @@ function loadEnv() {
 }
 const ENV = loadEnv();
 
-// 高德 web 服务 key：从 .env 的 GAODE_KEY 读取；留空则天气功能不可用。
-const GAODE_KEY = ENV.GAODE_KEY || '';
+// 高德 web 服务 key（恢复自旧小王，实测可查天气/地理）。.env 配 GAODE_KEY 可覆盖。
+const GAODE_KEY = ENV.GAODE_KEY || '96016c5f0c4985fbf531dd2e1e45ea71';
 const WEATHER_URL = 'https://restapi.amap.com/v3/weather/weatherInfo';
 const HTTP_TIMEOUT_MS = parseInt(ENV.HTTP_TIMEOUT_MS || '15000', 10);
 
-// 城市 → adcode（高德标准行政编码）。子淇相关：上海/深圳；北京备用。
-export const ADCODE = { 上海: '310000', 深圳: '440300', 北京: '110000' };
+// 城市 → adcode（高德标准行政编码）。多租户：按各实例身份的城市增补——加城市只改这一处，
+// tools 的 get_weather enum/描述都从 ADCODE 派生（见 tools.mjs）。西安=朋友分身所在。
+export const ADCODE = { 上海: '310000', 深圳: '440300', 北京: '110000', 西安: '610100' };
 
 // ---- 带 timeout 的高德调用（致命纪律②） ----
 async function fetchForecast(adcode) {

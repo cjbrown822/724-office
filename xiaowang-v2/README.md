@@ -1,46 +1,54 @@
 # 小王 v2
 
-个人 AI agent「小王」🃏 的第二代实现：单 Node 进程 + 单 WAL SQLite + 手写 agentic 循环，零框架依赖，以企业微信为唯一界面，7×24 常驻一台 2C2G 服务器。
+子淇的个人 AI agent「小王」🦞 的新躯体。单 Node 进程 + 单 WAL SQLite + 手写 agentic 循环。四样能力——跨天 durable 执行、自愈恢复、分层记忆、agentic 工具循环——都从同一个持久执行内核长出来。
 
-本仓库根目录的 7/24 Office（Python 多租户系统）是它的前代。v2 的路线是收敛而非扩张：从"36 个工具的多租户网关"收敛为"一个人的常驻 agent 进程"。核心设计原则：
+架构全貌见 `BLUEPRINT.md`（含红队逐条收口、数据模型、分阶段建造、诚实账）。
 
-- **失败是系统问题，不是 prompt 问题**——行为约束优先靠结构（schema 锁、terminal-tool 短路、确定性注入），不靠 prompt 自觉
-- **指令遵循靠结构分工**——模型做模糊路由（自然语言→工具+参数），harness 做确定的五件事（执行回灌 / schema 约束 / 暴露状态 / 审批闸 / 幂等），绝不用规则在 loop 之前截断模糊意图
-- **为删除而构建**——每个模块可整块移除；模型变强时管道退役
-- **上下文是最稀缺资源**——top-k 注入，绝不整库塞 prompt
+## 现状（2026-06-25）
 
-## 能力
+**P1 离线验证通过，尚未 ECS burn-in。**
 
-| 能力 | 实现 |
+- ✅ 10 个 `.mjs` 全过 `node --check`
+- ✅ 模块自检 **146/146 通过**：db 27 · durable 31 · memory 28 · tools 15 · prompt 12 · loop 7 · llm 6 · adapter 8 · main 6 · watchdog 6
+- ✅ 真 DeepSeek 跑通一次 CLI turn：进程启动 → agentic loop 调 LLM → 人格回复
+- ⏳ **还没做**：企微 adapter 端到端（P3）；ECS 上 FTS5 复测（本地可用）；连续 7 晚 burn-in；facts 自动抽取/向量召回（backlog）
+
+"P1 跑通" ≠ "稳"。要叫稳，按 `BLUEPRINT.md` 诚实账需 ECS 上挂 systemd 连续 7 晚不断 + 经历真实 429/kill-9/跨天补跑验证。
+
+## 文件
+
+| 文件 | 作用 |
 |---|---|
-| agentic 工具循环 | 15 个工具，执行回灌，三护栏终止（轮数 / 墙钟 / no-progress） |
-| durable 执行 | 跨天任务、崩溃恢复重放、outbox at-least-once + 去重、进程外 watchdog |
-| 分层记忆 | 逐字近窗 + pinned 锚点 + FTS5 召回 + 媒体专项召回；"会诚实遗忘的伙伴 + 不遗忘的黑匣子"双层遗忘律 |
-| 轮次装配 | 微信把一个意思拆成一串事件（连发短句 / 图配文 / 语音）——安静窗口 + 媒体下载栅栏攒齐"一轮"，装配成带到达时刻与模态的时间事实，交模型一次理解一次回复 |
-| 时间感 | 轮间时间间隔标记 + 当前消息〔此刻〕时间戳——模型看得见人类在聊天 UI 里免费获得的时间流逝 |
-| 多模态 | 图片视觉描述、语音 SILK→PCM→ASR 转写 |
-| ESM 采集 | 晨晚打卡 + `#` 快记黑匣子 + 周回顾；"只问不评"红线由 terminal-tool 短路结构性保证 |
-| 多租户 | 前置路由器按 sender 白名单分发到独立实例（独立库 / 身份 / 配置），default-deny |
+| `db.mjs` | 持久层：单写连接、全部表/索引、FTS5 try/catch 降级、`tx()` |
+| `durable.mjs` | durable 内核：tasks/steps/timers/outbox + worker tick（调度/重放/relay/心跳） |
+| `loop.mjs` | agentic 控制环：组上下文→LLM→工具→回灌→护栏终止 |
+| `llm.mjs` | LLM 收口：重试退避 + DeepSeek↔Kimi fallback，纯 fetch |
+| `tools.mjs` | 工具注册表 + 副作用 dedup wrapper，8 个首版工具 |
+| `memory.mjs` | 分层记忆：episodes 只追加 + facts 半自动 + `retrieve()`（FTS5/LIKE 降级） |
+| `prompt.mjs` | system prompt 组装（🦞 人格 + 召回注入） |
+| `adapter.mjs` | 渠道适配：CLI（起步）/ 企微（P3）+ outbox relay |
+| `main.mjs` | 进程入口：initDb→注册工具→startWorker→startAdapter |
+| `watchdog_cron.mjs` | 进程外看门狗（crontab，独立于主进程） |
+| `deploy/` | probe.sh（环境探针）/ install.sh / systemd unit |
 
-## 设计文档
-
-| 文档 | 内容 |
-|---|---|
-| `BLUEPRINT.md` | 初版蓝图：红队逐条收口、数据模型、分阶段建造、诚实账 |
-| `BLUEPRINT_CONTINUITY.md` | 连续性引擎设计：四层记忆架构、六个"露馅点"清单、立场"靠谱 > 无缝" |
-| `ARCHITECTURE.md` | 全景架构地图 + 「协议层 vs 对话层」边界原则（聊天软件里 agent 行为设计的总准绳） |
-
-## 运行
-
-Node ≥ 22（用 node:sqlite，无 native 依赖）。
+## 跑
 
 ```bash
-cp .env.example .env   # 配 LLM key；无企微凭证时自动落 CLI 模式
-node main.mjs
+# 自检（离线 mock，不联网，临时 db）
+XW2_DB_PATH=/tmp/t.db node db.mjs --selftest      # 各模块同理
+
+# 本地 CLI 真聊（需 DeepSeek key）
+cp .env.example .env        # 填 LLM_API_KEY；不填 WECOM_TOKEN 即 CLI 模式
+node main.mjs               # 输入一行回车，ctrl-d 退出
 ```
 
-每个模块自带离线 selftest（不联网、临时库）：
+## 部署（按 BLUEPRINT.md 分阶段）
 
 ```bash
-node <module>.mjs --selftest   # 16 个模块，330+ 断言
+bash deploy/probe.sh        # P0：先在 ECS 验 Node 版本 + FTS5，动手前第一件事
+bash deploy/install.sh      # scp /opt/xiaowang-v2、装 systemd、装 crontab 看门狗、ss 查端口
 ```
+
+## 红线
+
+与 live ESM bot（`/opt/esm-bot/`，端口 8080）**并行共存**：v2 用 `/opt/xiaowang-v2/`、独立 `v2.db`、端口 8090。**绝不碰 live 的 `esm.sqlite` / 端口 / workspace**。部署前 `ss -tlnp | grep -E '8080|8090'` 查冲突。

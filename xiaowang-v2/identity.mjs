@@ -20,6 +20,7 @@ const DIR = import.meta.dirname;
 const DEFAULT_IDENTITY = {
   ownerName: '主人',           // 小王对主人的称呼
   profileNote: '',             // 主人专属的行为批注（如漂移提醒）；通用版留空
+  avatarNote: '',              // 分身人格层：非空时小王同时是"某人的数字分身"（语气/经历/隐私规则整段在此）；空=纯小王
   weatherMorningCities: ['上海'],   // 早播天气城市
   weatherEveningCities: ['上海'],   // 晚播天气城市
 };

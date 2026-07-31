@@ -18,7 +18,7 @@
 | **DatabaseSync 同步阻塞 × 单进程 × WatchdogSec=30s = 长任务被误杀/自杀循环** | **真,且物理矛盾** | **首版直接不配 WatchdogSec**(live bot 现在就只有 `Restart=always RestartSec=5`,没 watchdog,跑得好好的)。进程级只做 crash-restart。"卡死检测"降级为:外部 cron 每 5min 查 heartbeat 表时间戳,静默 >10min 才 `systemctl restart` + 报警。hang 检测灵敏度换稳定,值。 |
 | **同步 fsync 卡 event loop / "WAL 让读写并发"在单同步连接上是 0 收益的死概念** | **真** | **承认全串行**(n=1 负载低,可行)。纪律:① DB 写做小事务,单条 UPDATE 原子改 status+result;② **LLM/HTTP 调用走 async fetch,不在 DB 事务里、不占任何锁**;③ 不开第二写连接(避免 SQLITE_BUSY)。蓝图里删掉所有"WAL 让读写并发互不阻塞"的错误表述——WAL 在这里的真实价值只是 crash 安全 + 读不脏读,不是并发。 |
 | **effectively-once 是假的**(SQLite 事务无法和外部 HTTP 原子提交) | **真,诚实性缺陷** | **改口径:at-least-once + 尽力去重,极小概率重发**。不再宣称 effectively-once。`send_message` 顺序固定为"先查 dedup → 发 → 立刻写 dedup",崩在中间窗口会重发一次——n=1 一天几条消息,可接受;且企微侧重发同文案不致命。 |
-| **over-engineering:8~12 模块/11 表,违背自己喊的"少即是多"** | **真——确属 over-engineering，砍** | **硬护栏:首版文件 ≤7(实际 6)、表 ≤6**。砍掉:三态熔断→降级为重试2次+Kimi fallback;dead_letter→首版用 tasks.status='dead' 一个字段;Sawtooth/Facts-supersede 自动链/每轮自动抽取/向量列/spawn_subagent/OTel 字段/Ralph attempt_notes——**全进 backlog,首版一个不进**。 |
+| **over-engineering:8~12 模块/11 表,违背自己喊的"少即是多"** | **真,正中子淇"造工具>用工具"模式** | **硬护栏:首版文件 ≤7(实际 6)、表 ≤6**。砍掉:三态熔断→降级为重试2次+Kimi fallback;dead_letter→首版用 tasks.status='dead' 一个字段;Sawtooth/Facts-supersede 自动链/每轮自动抽取/向量列/spawn_subagent/OTel 字段/Ralph attempt_notes——**全进 backlog,首版一个不进**。 |
 | **每轮跑小 LLM 抽取 facts = 自动放大 MEMORY.md 旧病(抽错的"事实"污染上下文)** | **真** | **首版:episodes 全留(只追加,无损);facts 不自动抽取**。检索就召回最近+关键词命中的 episodes。facts 表建好但**首版只手动/半自动写入**(经一个 `staging` 审核位),跑稳几周再考虑开自动抽取。 |
 | **missed-timer 补跑语义欠定义**(关机3天,每天22:30 的 timer 补1次还是3次) | **真,核心用例欠定义** | **明确三态 catchup_policy**:`'skip'`(只跑下一次,如每日提醒)、`'once'`(过期补跑一次,如"3天后提醒")、`'all'`(每个错过的都补,罕见,默认不给)。周期 timer 默认 `'skip'`。 |
 | **报警依赖进程内 outbox relay,进程彻底死时报警发不出** | **真,报警链在最该报警时断裂** | **报警走进程外**:一个独立的极小 cron 脚本 `watchdog_cron.mjs`(systemd timer 或 crontab,**不依赖主进程**)查 heartbeat 时间戳,超时直接调企微发送 API 报警。主进程内的 outbox 只管业务消息。 |
@@ -106,7 +106,7 @@
 所有写经 `db.tx()`;状态变更单条原子 UPDATE。
 
 ### 6. 与 live bot 共存(物理隔离三件套)
-- **目录**:ECS `/opt/xiaowang-v2/`(live bot 在 `/opt/esm-bot/`)。本地 `<local-repo>`,**不复用 digital-twin 任何代码**。
+- **目录**:ECS `/opt/xiaowang-v2/`(live bot 在 `/opt/esm-bot/`)。本地 `<local-repo>\`,**不复用 digital-twin 任何代码**。
 - **db**:`/opt/xiaowang-v2/v2.db`,绝不碰 live 的 `esm.sqlite`/`seed.sqlite`。
 - **端口**:live 占 8080(企微回调)+8787(UI)。v2 CLI 阶段不占端口;企微 adapter 用 **8090**,Caddy 按 path 分流。**部署前 `ss -tlnp | grep -E '8080|8090'` 查冲突**。
 - **systemd**:独立 unit `xiaowang-v2.service`(`/usr/local/bin/node /opt/xiaowang-v2/main.mjs`,`Restart=always RestartSec=5`),与 live 互不影响。
