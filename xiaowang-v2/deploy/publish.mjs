@@ -143,8 +143,13 @@ export function stubIdentity(jsonText) {
 
 // 公开版要额外造出来的文件：真人租户的身份文件本来就 gitignore（私有库里都没有），
 // 但公开库缺了它就看不出"多租户长什么样"。所以给一个纯模板——里面没有任何真实数据。
+//
+// 为什么叫 .example：随源码一起发出去的 .gitignore 里写着忽略 identities/friend.json，
+// 于是公开库 git add 会**静默跳过**同名文件——模板根本进不了提交（实测踩到）。
+// 换成仓库既有的 .example 约定（.env.example / friend.env.example / router.config.example.json），
+// 既不被忽略，也一眼看得出"这是模板不是真配置"。
 export const EMIT = [
-  ['identities/friend.json', JSON.stringify({
+  ['identities/friend.example.json', JSON.stringify({
     ownerName: '朋友',
     profileNote: '',
     weatherMorningCities: ['上海'],
@@ -328,7 +333,10 @@ if (IS_MAIN && process.argv.includes('--selftest')) {
   ok(stub.weatherEveningCities.length === 1 && stub.weatherEveningCities[0] === '上海', 'stubIdentity 天气城市只留常驻地（第二个城市=行踪，不公开）');
 
   // 公开版模板：必须自身干净，否则等于从闸的内侧漏进去
-  ok(EMIT.some(([p]) => p === 'identities/friend.json'), 'EMIT 造出真人租户身份的纯模板（源库里没有这个文件）');
+  ok(EMIT.some(([p]) => p === 'identities/friend.example.json'), 'EMIT 造出真人租户身份的纯模板（源库里没有这个文件）');
+  // 关键回归：模板名不能撞上随源码发出去的 .gitignore 规则，否则公开库 git add 静默跳过它
+  const ignored = readFileSync(join(REPO, '.gitignore'), 'utf8').split('\n').map((l) => l.trim());
+  ok(EMIT.every(([p]) => !ignored.includes(p)), 'EMIT 文件名不被自带的 .gitignore 吞掉（实测踩过）');
   ok(EMIT.every(([, c]) => scanText(c).length === 0 && !/郭/.test(c)), 'EMIT 模板本身零命中、不含真人姓名');
 
   // 豁免标记：能生效，且必须显式写在那一行上、被计数（不允许看不见的豁免）
